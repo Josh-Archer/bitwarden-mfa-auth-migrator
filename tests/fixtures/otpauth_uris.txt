@@ -1,0 +1,3 @@
+# Synthetic otpauth URIs for tests — placeholders only (EXAMPLE*), not real credentials.
+otpauth://totp/Example:alice@example.com?secret=EXAMPLENOTREALAA&issuer=Example&algorithm=SHA1&digits=6&period=30
+otpauth://totp/GitHub:bob?secret=EXAMPLENOTREALBB&issuer=GitHub&algorithm=SHA256&digits=8&period=60
