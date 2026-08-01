@@ -18,7 +18,16 @@ A Python tool to migrate TOTP/HOTP secrets from common authenticator apps into a
   ```bash
   pip install -r requirements.txt
   ```
-- For **direct import** (`--import-bw`): [Bitwarden CLI](https://bitwarden.com/help/cli/) (`bw`) installed, logged in, and unlocked. Works with Bitwarden cloud or a self-hosted/Vaultwarden server configured via `bw config server`.
+- For best QR detection, install **pyzbar** (already listed in `requirements.txt`) and the system `libzbar` library. Without pyzbar, dense Google Authenticator export QRs often fail to decode.
+
+## Development / Tests
+
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+python -m pytest -q
+```
+
+CI runs the same unit suite on pull requests (see `.github/workflows/ci.yml`).
 
   On some systems `pyzbar` also needs the system ZBar library (e.g. `zbar` / `libzbar0`).
 
@@ -42,7 +51,30 @@ Many apps (FreeOTP, andOTP export-as-URI, Authy after conversion, password manag
 otpauth://totp/Example:user@example.com?secret=EXAMPLENOTREALAA&issuer=Example
 ```
 
-Save one URI per line in a `.txt` file (comments starting with non-URI text are fine):
+**Secure session handling**
+
+| Approach | Recommendation |
+|---|---|
+| `BW_SESSION` environment variable | **Preferred.** Not passed on argv; clear when done. |
+| `--bw-session <key>` | Supported but **discouraged** (visible in process list / shell history). |
+
+The tool never writes `BW_SESSION` or TOTP secrets to log files. Account labels are only printed if you omit `--quiet`.
+
+**Failure handling**
+
+- If the vault is locked, `bw` is missing, or `bw sync` fails **before** creates, the tool aborts with a non-zero exit and **creates no items**.
+- If some item creates fail mid-run, the summary reports exact success/failure counts and lists failed accounts (unless `--quiet`). Exit code is non-zero (`2` for partial, `1` for total failure). Already-created items remain in the vault — there is **no silent partial success**.
+
+Optional flags for direct import:
+
+- `--bw-folder "My Folder"` — destination folder (default: `Google Authenticator Migration`). Use `--bw-folder ""` for no folder.
+- `-o path.csv` — also write a CSV **only if you explicitly request it** (not recommended; delete immediately).
+
+### 4. Options
+
+- `--output`, `-o`: Specify output CSV filename. Default without `--import-bw`: `bitwarden_import.csv`. With `--import-bw`, omitted unless you set `-o`.
+- `--quiet`, `-q`: Suppress printing account names to the console (useful for privacy).
+- `--require-zbar`: Fail immediately if pyzbar is not installed (recommended for dense export QRs).
 
 ```bash
 python ga_to_bitwarden.py my_uris.txt
@@ -114,6 +146,18 @@ Example:
 ```bash
 python ga_to_bitwarden.py C:\exports\ --output my_codes.csv --quiet
 ```
+
+### Exit codes / errors
+
+When no accounts are exported, the tool reports a **distinct** error instead of a silent empty file:
+
+| Situation | Error type | Typical exit code |
+|-----------|------------|-------------------|
+| pyzbar missing and no QR decoded | `MissingDependencyError` | 2 |
+| Images/QR unreadable | `UnreadableQRError` | 1 |
+| QR found but payload empty/invalid | `EmptyPayloadError` | 3 |
+
+The tool also refuses to write an empty CSV.
 
 ## Importing to Bitwarden / Vaultwarden
 
