@@ -1,0 +1,21 @@
+{
+  "authenticator_tokens": [
+    {
+      "account_type": "Example",
+      "name": "alice@example.com",
+      "issuer": "Example",
+      "decrypted_seed": "EXAMPLENOTREALAA",
+      "digits": 6,
+      "unique_id": "1001"
+    },
+    {
+      "account_type": "GitHub",
+      "name": "bob",
+      "issuer": "GitHub",
+      "secret": "EXAMPLENOTREALBB",
+      "digits": 8,
+      "algorithm": "SHA256",
+      "unique_id": "1002"
+    }
+  ]
+}
