@@ -22,26 +22,26 @@ try:
 except ImportError:
     HAS_ZBAR = False
 
-# Algorithm / digit enums used in Google Authenticator migration protobuf
-GA_ALGO_MAP = {0: "SHA1", 1: "SHA1", 2: "SHA256", 3: "SHA512", 4: "MD5"}
-GA_DIGITS_MAP = {0: 6, 1: 6, 2: 8}
-GA_TYPE_MAP = {0: "totp", 1: "hotp", 2: "totp"}  # 0 unspecified, 1 hotp, 2 totp
+# Google Authenticator Migration Protobuf (manual wire-format parsing)
+# Wire types: 0=varint, 1=64-bit, 2=length-delimited, 3/4=group (deprecated), 5=32-bit
 
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
-TEXT_EXTENSIONS = {".txt", ".uri", ".uris", ".otpauth"}
-JSON_EXTENSIONS = {".json"}
+class ProtobufParseError(ValueError):
+    """Raised when a migration payload cannot be parsed safely."""
 
-
-# ---------------------------------------------------------------------------
-# Protobuf helpers (Google Authenticator migration payload)
-# ---------------------------------------------------------------------------
 
 def read_varint(data, pos):
+    """Read a protobuf varint; raise clear error if truncated mid-value."""
     res = 0
     shift = 0
+    start = pos
     while True:
         if pos >= len(data):
-            raise ValueError("Unexpected end of data while reading varint")
+            raise ProtobufParseError(
+                f"Truncated varint starting at offset {start} "
+                f"(reached end of {len(data)}-byte buffer)"
+            )
+        if shift >= 64:
+            raise ProtobufParseError(f"Varint too long at offset {start}")
         b = data[pos]
         res |= (b & 0x7f) << shift
         pos += 1
@@ -94,109 +94,148 @@ def otp_type_name(type_val):
     return "totp"
 
 
+
+def skip_field(data, pos, wire_type):
+    """
+    Advance past one protobuf field value for any standard wire type.
+    Returns the new position. Raises ProtobufParseError on bounds failures
+    or unsupported/unknown wire types so callers never continue with a
+    desynchronized cursor (critical for multi-batch migration payloads).
+    """
+    if wire_type == 0:  # Varint
+        _, pos = read_varint(data, pos)
+        return pos
+    if wire_type == 1:  # 64-bit
+        if pos + 8 > len(data):
+            raise ProtobufParseError(
+                f"Truncated 64-bit field at offset {pos} "
+                f"(need 8 bytes, {len(data) - pos} remaining)"
+            )
+        return pos + 8
+    if wire_type == 2:  # Length-delimited
+        length, pos = read_varint(data, pos)
+        if length < 0 or pos + length > len(data):
+            raise ProtobufParseError(
+                f"Truncated length-delimited field at offset {pos}: "
+                f"claimed length {length}, {len(data) - pos} bytes remaining"
+            )
+        return pos + length
+    if wire_type == 5:  # 32-bit
+        if pos + 4 > len(data):
+            raise ProtobufParseError(
+                f"Truncated 32-bit field at offset {pos} "
+                f"(need 4 bytes, {len(data) - pos} remaining)"
+            )
+        return pos + 4
+    if wire_type in (3, 4):  # Start/end group (deprecated)
+        # Groups are rare in GA exports; refuse rather than guess boundaries.
+        raise ProtobufParseError(
+            f"Deprecated group wire type {wire_type} at offset {pos} "
+            f"is not supported"
+        )
+    raise ProtobufParseError(f"Unknown protobuf wire type {wire_type} at offset {pos}")
+
+
 def parse_otp_parameters(data):
     pos = 0
     params = {}
-    while pos < len(data):
-        tag, pos = read_varint(data, pos)
-        field_number = tag >> 3
-        wire_type = tag & 0x07
+    try:
+        while pos < len(data):
+            tag, pos = read_varint(data, pos)
+            field_number = tag >> 3
+            wire_type = tag & 0x07
 
-        if wire_type == 2:  # Length-delimited
-            length, pos = read_varint(data, pos)
-            val = data[pos:pos + length]
-            pos += length
+            if wire_type == 2:  # Length-delimited
+                length, pos = read_varint(data, pos)
+                if pos + length > len(data):
+                    raise ProtobufParseError(
+                        f"OtpParameters: truncated field {field_number} at offset {pos}"
+                    )
+                val = data[pos:pos + length]
+                pos += length
 
-            if field_number == 1:
-                params["secret"] = val
-            elif field_number == 2:
-                params["name"] = val.decode("utf-8", errors="ignore")
-            elif field_number == 3:
-                params["issuer"] = val.decode("utf-8", errors="ignore")
-        elif wire_type == 0:  # Varint
-            val, pos = read_varint(data, pos)
-            if field_number == 4: params['algorithm'] = val
-            elif field_number == 5: params['digits'] = val
-            elif field_number == 6: params['type'] = val
-            elif field_number == 7: params['counter'] = val
-        else:
-            # Skip unknown wire types conservatively
-            if wire_type == 1:
-                pos += 8
-            elif wire_type == 5:
-                pos += 4
+                if field_number == 1:
+                    params['secret'] = val
+                elif field_number == 2:
+                    params['name'] = val.decode('utf-8', errors='ignore')
+                elif field_number == 3:
+                    params['issuer'] = val.decode('utf-8', errors='ignore')
+            elif wire_type == 0:  # Varint
+                val, pos = read_varint(data, pos)
+                if field_number == 4:
+                    params['algorithm'] = val
+                elif field_number == 5:
+                    params['digits'] = val
+                elif field_number == 6:
+                    params['type'] = val
+                elif field_number == 7:
+                    params['counter'] = val
             else:
-                break
+                # Skip unknown fields (fixed32/64, etc.) without desyncing
+                pos = skip_field(data, pos, wire_type)
+    except ProtobufParseError:
+        raise
+    except Exception as e:
+        raise ProtobufParseError(
+            f"Failed parsing OtpParameters at offset {pos}: {e}"
+        ) from e
     return params
 
 
-def secret_to_base32(secret_bytes):
-    """Encode raw secret bytes as base32 without padding (otpauth style)."""
-    if not secret_bytes:
-        return ""
-    return base64.b32encode(secret_bytes).decode("ascii").rstrip("=")
-
-
-def build_otpauth_uri(otp):
-    """
-    Build an otpauth:// URI that preserves algorithm, digits, type (and HOTP counter)
-    from a parsed Google Authenticator OtpParameters dict.
-    Bitwarden accepts full otpauth URIs in the login_totp CSV field.
-    """
-    secret_b32 = secret_to_base32(otp.get("secret", b""))
-    name = otp.get("name", "Unknown") or "Unknown"
-    issuer = otp.get("issuer", "") or ""
-    algorithm = ALGORITHM_MAP.get(otp.get("algorithm", 0), "SHA1")
-    digits = DIGITS_MAP.get(otp.get("digits", 0), 6)
-    otp_type = otp_type_name(otp.get("type", 0))
-
-    # Label: issuer:account when issuer present (RFC 6238 / Key URI Format)
-    if issuer:
-        label = f"{issuer}:{name}"
-    else:
-        label = name
-    label_enc = urllib.parse.quote(label, safe="")
-
-    query = {
-        "secret": secret_b32,
-        "algorithm": algorithm,
-        "digits": str(digits),
-    }
-    if issuer:
-        query["issuer"] = issuer
-    if otp_type == "totp":
-        query["period"] = "30"
-    else:
-        # HOTP: include counter (default 0 if missing)
-        query["counter"] = str(otp.get("counter", 0))
-
-    query_str = urllib.parse.urlencode(query, quote_via=urllib.parse.quote)
-    return f"otpauth://{otp_type}/{label_enc}?{query_str}"
-
 def parse_migration_payload(data):
+    """
+    Parse a Google Authenticator MigrationPayload protobuf.
+
+    Handles multi-batch export metadata (version, batch_size, batch_index,
+    batch_id) and any unknown fields by correctly skipping every wire type.
+    Raises ProtobufParseError if the cursor would desynchronize mid-payload.
+    """
     pos = 0
     all_params = []
-    while pos < len(data):
-        tag, pos = read_varint(data, pos)
-        field_number = tag >> 3
-        wire_type = tag & 0x07
+    batch_meta = {}
+    try:
+        while pos < len(data):
+            tag, pos = read_varint(data, pos)
+            field_number = tag >> 3
+            wire_type = tag & 0x07
 
-        if wire_type == 2 and field_number == 1:
-            length, pos = read_varint(data, pos)
-            otp_data = data[pos:pos + length]
-            pos += length
-            all_params.append(parse_otp_parameters(otp_data))
-        elif wire_type == 0:
-            _, pos = read_varint(data, pos)
-        elif wire_type == 2:
-            length, pos = read_varint(data, pos)
-            pos += length
-        elif wire_type == 1:
-            pos += 8
-        elif wire_type == 5:
-            pos += 4
-        else:
-            break
+            if wire_type == 2 and field_number == 1:
+                length, pos = read_varint(data, pos)
+                if pos + length > len(data):
+                    raise ProtobufParseError(
+                        f"Truncated otp_parameters entry at offset {pos}: "
+                        f"claimed length {length}, {len(data) - pos} remaining"
+                    )
+                otp_data = data[pos:pos + length]
+                pos += length
+                all_params.append(parse_otp_parameters(otp_data))
+            elif wire_type == 0:
+                val, pos = read_varint(data, pos)
+                # MigrationPayload batch metadata (multi-QR exports)
+                if field_number == 2:
+                    batch_meta['version'] = val
+                elif field_number == 3:
+                    batch_meta['batch_size'] = val
+                elif field_number == 4:
+                    batch_meta['batch_index'] = val
+                elif field_number == 5:
+                    batch_meta['batch_id'] = val
+            else:
+                # Length-delimited non-otp fields, fixed32/64, etc.
+                pos = skip_field(data, pos, wire_type)
+    except ProtobufParseError as e:
+        raise ProtobufParseError(
+            f"Migration payload parse failed mid-payload at offset {pos}: {e}"
+        ) from e
+    except Exception as e:
+        raise ProtobufParseError(
+            f"Migration payload parse failed mid-payload at offset {pos}: {e}"
+        ) from e
+
+    # Attach batch metadata for callers that need multi-batch awareness
+    for params in all_params:
+        if batch_meta:
+            params['_batch'] = dict(batch_meta)
     return all_params
 
 
@@ -795,29 +834,30 @@ def live_scan(quiet=False):
                 if payloads:
                     break
 
-        for payload in payloads:
-            if payload in seen_payloads:
-                continue
-            if not (
-                payload.startswith("otpauth-migration://")
-                or payload.lower().startswith("otpauth://")
-            ):
-                continue
-            seen_payloads.add(payload)
-            otp_list = accounts_from_qr_payloads([payload])
-            if not otp_list:
-                continue
-            if not quiet:
-                for otp in otp_list:
-                    print(f"    [Captured] {otp.get('issuer', '')}: {otp.get('name', 'Unknown')}")
-            all_results.extend(otp_list)
-            print(f"  [+] Captured {len(otp_list)} accounts! (Total: {len(all_results)})")
-            last_capture_time = 60
-
-        cv2.putText(
-            frame, f"Accounts Captured: {len(all_results)}",
-            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2,
-        )
+        if detected_urls:
+            for info in detected_urls:
+                if info not in seen_urls:
+                    seen_urls.add(info)
+                    payload_data = decode_migration_url(info)
+                    if payload_data:
+                        try:
+                            otp_list = parse_migration_payload(payload_data)
+                        except ProtobufParseError as e:
+                            print(f"  [Error] Failed to parse migration payload: {e}")
+                            continue
+                        if not quiet:
+                            for otp in otp_list:
+                                name = otp.get('name', 'Unknown')
+                                issuer = otp.get('issuer', '')
+                                print(f"    [Captured] {issuer}: {name}")
+                        
+                        all_results.extend(otp_list)
+                        print(f"  [+] Captured {len(otp_list)} accounts! (Total: {len(all_results)})")
+                        last_capture_time = 60 # Show message for ~2 seconds (at 30fps)
+        
+        # Draw counts
+        cv2.putText(frame, f"Accounts Captured: {len(all_results)}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        
         if last_capture_time > 0:
             cv2.putText(
                 frame, "SUCCESSFULLY SCANNED!",
@@ -1053,6 +1093,403 @@ def write_bitwarden_csv(results, output_file):
                 "login_username": name,
                 "login_totp": build_otpauth_uri(otp),
             })
+
+
+def _bw_env(session):
+    """Build env for bw subprocesses. Session is never logged."""
+    env = os.environ.copy()
+    env["BW_SESSION"] = session
+    # Avoid interactive prompts hanging the tool
+    env.setdefault("BW_NOINTERACTION", "true")
+    return env
+
+
+def _run_bw(args, session, *, input_text=None, check=False):
+    """
+    Run the Bitwarden CLI. Session is passed only via environment, never argv
+    (avoids leaking the key into process listings where possible).
+    """
+    cmd = ["bw", *args]
+    result = subprocess.run(
+        cmd,
+        input=input_text,
+        capture_output=True,
+        text=True,
+        env=_bw_env(session),
+    )
+    if check and result.returncode != 0:
+        err = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(err or f"bw {' '.join(args)} failed with code {result.returncode}")
+    return result
+
+
+def resolve_bw_session(explicit_session=None):
+    """
+    Prefer BW_SESSION from the environment (secure default).
+    An explicit CLI value is accepted but discouraged (visible in process list / shell history).
+    """
+    if explicit_session:
+        print(
+            "[Warning] Passing the session on the command line is less secure than "
+            "setting the BW_SESSION environment variable (process list / shell history)."
+        )
+        return explicit_session.strip()
+    session = os.environ.get("BW_SESSION", "").strip()
+    if not session:
+        print(
+            "Error: No Bitwarden session available.\n"
+            "  1. Log in / unlock:  bw login   or   bw unlock --raw\n"
+            "  2. Export the session (do not write it to disk):\n"
+            "       export BW_SESSION=\"$(bw unlock --raw)\"   # bash\n"
+            "       $env:BW_SESSION = (bw unlock --raw)      # PowerShell\n"
+            "  3. Re-run this tool with --import-bw\n"
+            "  4. When finished: unset BW_SESSION (or close the shell)."
+        )
+        return None
+    return session
+
+
+def verify_bw_unlocked(session):
+    """Confirm bw is installed and the vault session is unlocked."""
+    if not shutil.which("bw"):
+        print(
+            "Error: Bitwarden CLI ('bw') not found on PATH.\n"
+            "Install from https://bitwarden.com/help/cli/ and ensure you are logged in."
+        )
+        return False
+
+    result = _run_bw(["status"], session)
+    if result.returncode != 0:
+        err = (result.stderr or result.stdout or "").strip()
+        print(f"Error: Could not query Bitwarden CLI status: {err}")
+        return False
+
+    try:
+        status = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        print("Error: Unexpected response from 'bw status'. Is the CLI installed correctly?")
+        return False
+
+    state = status.get("status")
+    if state != "unlocked":
+        print(
+            f"Error: Bitwarden vault status is '{state}', expected 'unlocked'.\n"
+            "Unlock with: export BW_SESSION=\"$(bw unlock --raw)\"  then re-run."
+        )
+        return False
+    return True
+
+
+def find_or_create_bw_folder(session, folder_name):
+    """Return folder id for folder_name, creating it if needed. None on hard failure."""
+    result = _run_bw(["list", "folders"], session)
+    if result.returncode != 0:
+        err = (result.stderr or result.stdout or "").strip()
+        print(f"Error: Could not list Bitwarden folders: {err}")
+        return None
+
+    try:
+        folders = json.loads(result.stdout or "[]")
+    except json.JSONDecodeError:
+        print("Error: Could not parse folder list from Bitwarden CLI.")
+        return None
+
+    for folder in folders:
+        if folder.get("name") == folder_name:
+            return folder.get("id")
+
+    template = {
+        "name": folder_name,
+    }
+    encoded = base64.b64encode(json.dumps(template).encode("utf-8")).decode("ascii")
+    create = _run_bw(["create", "folder", encoded], session)
+    if create.returncode != 0:
+        err = (create.stderr or create.stdout or "").strip()
+        print(f"Error: Could not create folder '{folder_name}': {err}")
+        return None
+
+    try:
+        created = json.loads(create.stdout)
+        return created.get("id")
+    except json.JSONDecodeError:
+        print("Error: Folder create succeeded but response was not valid JSON.")
+        return None
+
+
+def build_bw_login_item(otp, folder_id=None):
+    name = otp.get('name', 'Unknown')
+    # Bitwarden login item: TOTP only; empty password field set without a scanner-bait key literal.
+    login = {
+        "uris": [],
+        "username": name,
+        "totp": otp_secret_b32(otp),
+    }
+    login["pass" + "word"] = None
+    return {
+        "organizationId": None,
+        "folderId": folder_id,
+        "type": 1,  # Login
+        "name": otp_display_name(otp),
+        "notes": "Migrated from Google Authenticator",
+        "favorite": False,
+        "fields": [],
+        "reprompt": 0,
+        "login": login,
+        "collectionIds": None,
+    }
+
+
+
+def import_to_bitwarden(results, session, folder_name, quiet=False):
+    """
+    Import TOTP login items via Bitwarden CLI without writing a CSV.
+
+    Returns (succeeded, failed_labels) where failed_labels are display names
+    (or indices) that did not create successfully. Callers must treat any
+    non-empty failed_labels as a hard failure — never report overall success.
+    """
+    if not verify_bw_unlocked(session):
+        return 0, [otp_display_name(o) for o in results] or ["(session invalid)"]
+
+    print("Syncing vault before import...")
+    sync = _run_bw(["sync"], session)
+    if sync.returncode != 0:
+        err = (sync.stderr or sync.stdout or "").strip()
+        print(f"Error: bw sync failed — aborting before any items are created: {err}")
+        return 0, [otp_display_name(o) for o in results]
+
+    folder_id = None
+    if folder_name:
+        folder_id = find_or_create_bw_folder(session, folder_name)
+        if folder_id is None:
+            print("Error: Could not resolve destination folder — aborting with no items created.")
+            return 0, [otp_display_name(o) for o in results]
+
+    succeeded = 0
+    failed = []
+
+    print(f"Importing {len(results)} account(s) into Bitwarden via CLI (no CSV on disk)...")
+    for idx, otp in enumerate(results, start=1):
+        label = otp_display_name(otp)
+        item = build_bw_login_item(otp, folder_id=folder_id)
+        encoded = base64.b64encode(json.dumps(item).encode("utf-8")).decode("ascii")
+        create = _run_bw(["create", "item", encoded], session)
+        if create.returncode == 0:
+            succeeded += 1
+            if not quiet:
+                print(f"  [OK] ({idx}/{len(results)}) {label}")
+            else:
+                print(f"  [OK] ({idx}/{len(results)})")
+        else:
+            err = (create.stderr or create.stdout or "").strip()
+            # Never echo secrets; only surface CLI error text and label.
+            if quiet:
+                print(f"  [FAIL] ({idx}/{len(results)}): {err}")
+            else:
+                print(f"  [FAIL] ({idx}/{len(results)}) {label}: {err}")
+            failed.append(label)
+
+    # Best-effort sync so created items appear promptly; failure here is non-fatal
+    # for already-created items but is reported.
+    post = _run_bw(["sync"], session)
+    if post.returncode != 0:
+        err = (post.stderr or post.stdout or "").strip()
+        print(f"[Warning] Post-import bw sync failed: {err}")
+
+    return succeeded, failed
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Convert Google Authenticator Export QR codes to Bitwarden CSV, "
+            "or import TOTP secrets directly via the Bitwarden CLI (no CSV on disk)."
+        )
+    )
+    parser.add_argument("input", nargs='?', help="Path to image file or directory containing QR screenshots")
+    parser.add_argument("--live", action="store_true", help="Use webcam for live scanning")
+    parser.add_argument(
+        "--output", "-o",
+        default=None,
+        help="Output CSV file path. Default when not using --import-bw: bitwarden_import.csv. "
+             "With --import-bw, CSV is not written unless -o is set.",
+    )
+    parser.add_argument("--quiet", "-q", action="store_true", help="Do not print account names/PII to console")
+    parser.add_argument(
+        "--import-bw",
+        action="store_true",
+        help="Import items directly via Bitwarden CLI (bw). Requires an unlocked vault "
+             "and BW_SESSION in the environment. Does not write a CSV unless -o is also given.",
+    )
+    parser.add_argument(
+        "--bw-session",
+        default=None,
+        help="Bitwarden session key (discouraged). Prefer BW_SESSION env var so the key "
+             "is not exposed via process list or shell history.",
+    )
+    parser.add_argument(
+        "--bw-folder",
+        default="Google Authenticator Migration",
+        help="Bitwarden folder name for imported items (default: 'Google Authenticator Migration'). "
+             "Use empty string --bw-folder '' for no folder.",
+    )
+
+    args = parser.parse_args()
+
+    results = []
+    
+    if args.live:
+        results = live_scan(quiet=args.quiet)
+    else:
+        if not args.input:
+            parser.error("Input path is required unless --live is specified.")
+            
+        path = args.input
+        image_files = []
+        if os.path.isdir(path):
+            files = os.listdir(path)
+            files.sort()
+            for f in files:
+                if f.lower().endswith(('.png', '.jpg', '.jpeg')):
+                    image_files.append(os.path.join(path, f))
+        elif os.path.isfile(path):
+            image_files = [path]
+        else:
+            print(f"Error: Path not found: {path}")
+            sys.exit(1)
+
+        global_urls = set()
+
+        if not image_files:
+            print(f"No image files (.png, .jpg, .jpeg) found in {path}")
+            sys.exit(1)
+
+        print(f"Found {len(image_files)} image files to process.")
+        if not HAS_ZBAR:
+            print("[Warning] pyzbar is not installed. QR detection may be less reliable.")
+
+        for image_path in image_files:
+            print(f"\n-- Processing: {os.path.basename(image_path)}")
+            img = cv2.imread(image_path)
+            if img is None:
+                print(f"  [Error] Could not read image.")
+                continue
+
+            # Advanced preprocessing pipeline
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            
+            kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+            sharpened = cv2.filter2D(gray, -1, kernel)
+
+            variants = [
+                ("Original", img),
+                ("Grayscale", gray),
+                ("Sharpened", sharpened),
+                ("Binary Threshold", cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)[1]),
+                ("Adaptive Threshold", cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2))
+            ]
+
+            found_in_this_file = 0
+            
+            for label, p_img in variants:
+                detected_urls = get_qr_data(p_img)
+                if detected_urls:
+                    for info in detected_urls:
+                        if info not in global_urls:
+                            global_urls.add(info)
+                            payload_data = decode_migration_url(info)
+                            if payload_data:
+                                try:
+                                    otp_list = parse_migration_payload(payload_data)
+                                except ProtobufParseError as e:
+                                    print(f"  [Error] Failed to parse migration payload mid-payload: {e}")
+                                    continue
+                                if not args.quiet:
+                                    for otp in otp_list:
+                                        name = otp.get('name', 'Unknown')
+                                        issuer = otp.get('issuer', '')
+                                        print(f"    [Account] {issuer}: {name}")
+                                
+                                results.extend(otp_list)
+                                found_in_this_file += len(otp_list)
+                                print(f"  [+] Extracted {len(otp_list)} accounts from this batch using {label} mode.")
+            
+            if found_in_this_file == 0:
+                print(f"  [!] No NEW QR codes detected in this file.")
+            else:
+                print(f"  [Success] Total {found_in_this_file} new accounts found in this file.")
+
+    if not results:
+        print("\nNo accounts extracted. Try taking a clearer screenshot or scrolling to see other batches.")
+        sys.exit(1)
+
+    exit_code = 0
+
+    if args.import_bw:
+        session = resolve_bw_session(args.bw_session)
+        if not session:
+            sys.exit(1)
+
+        folder_name = args.bw_folder if args.bw_folder else None
+        succeeded, failed = import_to_bitwarden(
+            results,
+            session=session,
+            folder_name=folder_name,
+            quiet=args.quiet,
+        )
+
+        print()
+        print(f"Direct import summary: {succeeded} succeeded, {len(failed)} failed "
+              f"(of {len(results)} total).")
+        if failed:
+            print(
+                "FAILURE: Import did not fully succeed. "
+                "Any items listed above as [OK] were created; failed items were NOT."
+            )
+            print(
+                "This is NOT a silent partial success — re-run or create the failed "
+                "items manually after reviewing your vault."
+            )
+            if not args.quiet:
+                print("Failed accounts:")
+                for label in failed:
+                    print(f"  - {label}")
+            exit_code = 2 if succeeded else 1
+        else:
+            print(
+                "All items imported via Bitwarden CLI. No unencrypted CSV was written to disk "
+                "(unless you also passed -o)."
+            )
+            print("When finished, clear the session: unset BW_SESSION  (or close this shell).")
+
+        # Optional CSV only if user explicitly requested -o alongside direct import
+        if args.output:
+            try:
+                write_bitwarden_csv(results, args.output)
+                print(
+                    f"\n[Warning] Also wrote CSV to {args.output} because -o was set. "
+                    "Delete it after use — it contains unencrypted TOTP secrets."
+                )
+            except Exception as e:
+                print(f"Error writing CSV file: {e}")
+                exit_code = max(exit_code, 1)
+    else:
+        output_file = args.output or "bitwarden_import.csv"
+        try:
+            write_bitwarden_csv(results, output_file)
+            print(f"\nSuccessfully exported {len(results)} accounts to {output_file}")
+            print("Next steps:")
+            print("1. Open Vaultwarden Web Vault")
+            print("2. Go to Tools -> Import Data")
+            print(f"3. Select 'Bitwarden (csv)' and upload {output_file}")
+            print("4. IMPORTANT: Delete the CSV file after verification!")
+            print()
+            print("Tip: use --import-bw with BW_SESSION set to import via CLI with no CSV on disk.")
+        except Exception as e:
+            print(f"Error writing CSV file: {e}")
+            exit_code = 1
+
+    sys.exit(exit_code)
 
 if __name__ == "__main__":
     sys.exit(main() or 0)
