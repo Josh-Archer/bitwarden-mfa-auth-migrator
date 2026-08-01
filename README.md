@@ -138,6 +138,27 @@ Fixture data under `tests/fixtures/` uses only public demo secrets (not real cre
 python -m unittest discover -s tests -v
 ```
 
+### TOTP field format (`login_totp`)
+
+Bitwarden’s CSV importer accepts either a bare base32 secret or a full
+[`otpauth://`](https://github.com/google/google-authenticator/wiki/Key-Uri-Format) URI
+in the `login_totp` column.
+
+This tool **always writes a full `otpauth://` URI**, including:
+
+| Parameter   | Source / default |
+|-------------|------------------|
+| `secret`    | Exported secret (base32, unpadded) |
+| `issuer`    | Account issuer when present |
+| `algorithm` | SHA1 / SHA256 / SHA512 / MD5 (from export) |
+| `digits`    | 6 or 8 (from export) |
+| `period`    | `30` (Google Authenticator standard; not in export payload) |
+| `counter`   | HOTP only (from export when present) |
+
+Writing the full URI ensures non-default algorithms and digit counts survive
+import. A bare secret alone would force Bitwarden’s defaults (SHA1, 6 digits)
+and break those accounts.
+
 ## ⚠️ Security Warning
 
 The generated CSV contains your **unencrypted 2FA secrets**.

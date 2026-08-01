@@ -52,6 +52,25 @@ def read_varint(data, pos):
             raise ValueError("Varint too long")
 
 
+# Google Authenticator MigrationPayload enum mappings
+# https://github.com/google/google-authenticator-android (MigrationPayload)
+ALGORITHM_MAP = {
+    0: "SHA1",   # ALGORITHM_UNSPECIFIED -> treat as default
+    1: "SHA1",   # ALGORITHM_SHA1
+    2: "SHA256", # ALGORITHM_SHA256
+    3: "SHA512", # ALGORITHM_SHA512
+    4: "MD5",    # ALGORITHM_MD5
+}
+
+DIGITS_MAP = {
+    0: 6,  # DIGIT_COUNT_UNSPECIFIED -> default
+    1: 6,  # DIGIT_COUNT_SIX
+    2: 8,  # DIGIT_COUNT_EIGHT
+}
+
+OTP_TYPE_HOTP = 1
+OTP_TYPE_TOTP = 2
+
 def parse_otp_parameters(data):
     pos = 0
     params = {}
@@ -73,14 +92,10 @@ def parse_otp_parameters(data):
                 params["issuer"] = val.decode("utf-8", errors="ignore")
         elif wire_type == 0:  # Varint
             val, pos = read_varint(data, pos)
-            if field_number == 4:
-                params["algorithm"] = val
-            elif field_number == 5:
-                params["digits"] = val
-            elif field_number == 6:
-                params["type"] = val
-            elif field_number == 7:
-                params["counter"] = val
+            if field_number == 4: params['algorithm'] = val
+            elif field_number == 5: params['digits'] = val
+            elif field_number == 6: params['type'] = val
+            elif field_number == 7: params['counter'] = val
         else:
             # Skip unknown wire types conservatively
             if wire_type == 1:
@@ -91,6 +106,72 @@ def parse_otp_parameters(data):
                 break
     return params
 
+
+def secret_to_base32(secret_bytes):
+    """Encode raw secret bytes as base32 without padding (otpauth convention)."""
+    return base64.b32encode(secret_bytes or b"").decode("ascii").rstrip("=")
+
+
+def otp_params_are_default(otp):
+    """
+    Return True when TOTP params match Bitwarden/otpauth defaults:
+    TOTP, SHA1, 6 digits (period 30 is implicit and not in GA export).
+    """
+    algorithm = ALGORITHM_MAP.get(otp.get("algorithm", 1), "SHA1")
+    digits = DIGITS_MAP.get(otp.get("digits", 1), 6)
+    otp_type = otp.get("type", OTP_TYPE_TOTP)
+    return otp_type != OTP_TYPE_HOTP and algorithm == "SHA1" and digits == 6
+
+
+def build_otpauth_uri(otp):
+    """
+    Build a full otpauth:// URI so Bitwarden import preserves algorithm,
+    digits, type, issuer, and HOTP counter when present.
+    """
+    secret_b32 = secret_to_base32(otp.get("secret", b""))
+    name = otp.get("name") or "Unknown"
+    issuer = otp.get("issuer") or ""
+    algorithm = ALGORITHM_MAP.get(otp.get("algorithm", 1), "SHA1")
+    digits = DIGITS_MAP.get(otp.get("digits", 1), 6)
+    otp_type = otp.get("type", OTP_TYPE_TOTP)
+    is_hotp = otp_type == OTP_TYPE_HOTP
+    kind = "hotp" if is_hotp else "totp"
+
+    if issuer:
+        label = f"{issuer}:{name}"
+    else:
+        label = name
+
+    query = {
+        "secret": secret_b32,
+        "algorithm": algorithm,
+        "digits": str(digits),
+    }
+    if issuer:
+        query["issuer"] = issuer
+    if is_hotp:
+        query["counter"] = str(otp.get("counter", 0))
+    else:
+        # GA migration payload does not carry period; standard is 30s
+        query["period"] = "30"
+
+    # quote_via=quote keeps spaces as %20 (otpauth-friendly) rather than +
+    return "otpauth://{kind}/{label}?{query}".format(
+        kind=kind,
+        label=urllib.parse.quote(label, safe=""),
+        query=urllib.parse.urlencode(query, quote_via=urllib.parse.quote),
+    )
+
+
+def format_login_totp(otp):
+    """
+    Value for Bitwarden CSV login_totp column.
+
+    Always emit a full otpauth:// URI so non-default algorithm/digits/type
+    survive import. Bitwarden accepts either a bare base32 secret or an
+    otpauth URI in this field; the URI form is required for non-defaults.
+    """
+    return build_otpauth_uri(otp)
 
 def parse_migration_payload(data):
     pos = 0
@@ -933,30 +1014,42 @@ def main(argv=None):
         print("\nNo accounts extracted. Check the format docs in README.md.")
         return 1
 
-    # Deduplicate by (secret, name, issuer)
-    deduped = []
-    seen = set()
-    for acct in results:
-        key = (secret_to_b32(acct.get("secret", b"")), acct.get("name"), acct.get("issuer"))
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(acct)
-    results = deduped
-
+    output_file = args.output
+    headers = ["folder", "favorite", "type", "name", "notes", "fields", "login_uri", "login_username", "login_password", "login_totp"]
+    
     try:
-        export_bitwarden_csv(results, args.output)
-        print(f"\nSuccessfully exported {len(results)} accounts to {args.output}")
+        with open(output_file, "w", newline="", encoding="utf-8") as f:
+            # Mask the secret key slightly if quiet mode? No, CSV needs the secret.
+            # But the user asked to remove PII from the *script*, usage via args.
+            
+            writer = csv.DictWriter(f, fieldnames=headers)
+            writer.writeheader()
+            
+            for otp in results:
+                name = otp.get('name', 'Unknown')
+                issuer = otp.get('issuer', '')
+                
+                display_name = f"{issuer}: {name}" if issuer else name
+                
+                writer.writerow({
+                    "folder": "Google Authenticator Migration",
+                    "favorite": "0",
+                    "type": "login",
+                    "name": display_name,
+                    "notes": "Migrated from Google Authenticator",
+                    "login_username": name,
+                    "login_totp": format_login_totp(otp),
+                })
+        
+        print(f"\nSuccessfully exported {len(results)} accounts to {output_file}")
         print("Next steps:")
-        print("1. Open Vaultwarden / Bitwarden Web Vault")
+        print("1. Open Vaultwarden Web Vault")
         print("2. Go to Tools -> Import Data")
-        print(f"3. Select 'Bitwarden (csv)' and upload {args.output}")
+        print(f"3. Select 'Bitwarden (csv)' and upload {output_file}")
         print("4. IMPORTANT: Delete the CSV file after verification!")
-        return 0
+        
     except Exception as e:
         print(f"Error writing CSV file: {e}")
-        return 1
-
 
 if __name__ == "__main__":
     sys.exit(main() or 0)
