@@ -4,12 +4,11 @@ A Python tool to migrate TOTP/HOTP secrets from common authenticator apps into a
 
 ## Features
 
-- **Google Authenticator export QR**: Screenshots or live webcam scan of migration QR codes.
-- **Standard `otpauth://` URIs**: Text files (or QR codes) containing one or more otpauth URIs.
-- **Aegis Authenticator**: Unencrypted Aegis JSON exports.
-- **Authy (community exports)**: Decrypted Authy JSON produced by common export tools.
-- **Robust QR parsing**: Uses `pyzbar` and image enhancement for dense/blurry codes.
-- **Secure**: Runs locally. Suppress console PII with `--quiet`.
+- **Decode Export QR Codes**: Reads screenshots of Google Authenticator export QR codes.
+- **Webcam Support**: Live scanning of QR codes directly from your phone screen.
+- **Robust Parsing**: Uses `pyzbar` and advanced image enhancement to read dense/blurry QR codes.
+- **Secure**: Runs locally. Can suppress PII output with `--quiet`.
+- **Full TOTP params**: Exports `otpauth://` URIs preserving algorithm (SHA1/SHA256/SHA512), digits (6/8), type (TOTP/HOTP), and HOTP counter—not secret-only defaults.
 
 ## Prerequisites
 
