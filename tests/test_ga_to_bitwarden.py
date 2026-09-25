@@ -21,8 +21,6 @@ if str(ROOT) not in sys.path:
 
 import ga_to_bitwarden as m  # noqa: E402
 from tests.protobuf_fixtures import (  # noqa: E402
-    make_migration_payload,
-    make_otp_parameters,
     migration_url_from_payload,
     sample_accounts_payload,
 )
@@ -237,7 +235,8 @@ class TestLiveScan(unittest.TestCase):
         payload, _ = sample_accounts_payload()
         mig_url = migration_url_from_payload(payload)
         otpauth_uri = (
-            "otpauth://totp/Example:user?secret=EXAMPLENOTREALAA&issuer=Example"
+            "otpauth://totp/Example:user"
+            "?secret=EXAMPLENOTREALAA&issuer=Example"
         )
 
         # Frame 1: mig_url and otpauth_uri. Frame 2: duplicate mig_url.
@@ -284,7 +283,8 @@ class TestLiveScan(unittest.TestCase):
         mock_vc.return_value = mock_cap
 
         otpauth_uri = (
-            "otpauth://totp/Example:user?secret=EXAMPLENOTREALAA&issuer=Example"
+            "otpauth://totp/Example:user"
+            "?secret=EXAMPLENOTREALAA&issuer=Example"
         )
         mock_qr.return_value = [otpauth_uri]
 
@@ -294,6 +294,39 @@ class TestLiveScan(unittest.TestCase):
 
         self.assertEqual(len(results), 1)
         self.assertNotIn("[Captured]", output)
+
+    @mock.patch("cv2.destroyAllWindows")
+    @mock.patch("cv2.imshow")
+    @mock.patch("cv2.waitKey", side_effect=[ord("q")])
+    @mock.patch("cv2.VideoCapture")
+    @mock.patch("ga_to_bitwarden.get_qr_payloads")
+    def test_live_scan_does_not_leak_secret_on_invalid_otpauth_uri(
+        self, mock_qr, mock_vc, mock_key, mock_show, mock_destroy
+    ):
+        mock_cap = mock.MagicMock()
+        mock_cap.isOpened.return_value = True
+        fake_frame = np.zeros((50, 50, 3), dtype=np.uint8)
+        mock_cap.read.return_value = (True, fake_frame)
+        mock_vc.return_value = mock_cap
+
+        placeholder_secret = "EXAMPLENOTREALAA"
+        invalid_uri = (
+            f"otpauth://invalid/Example:user?secret={placeholder_secret}"
+        )
+        mock_qr.return_value = [invalid_uri]
+
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as mock_out:
+            with mock.patch(
+                "sys.stderr", new_callable=io.StringIO
+            ) as mock_err:
+                results = m.live_scan(quiet=False)
+                stdout = mock_out.getvalue()
+                stderr = mock_err.getvalue()
+
+        self.assertEqual(results, [])
+        self.assertNotIn(placeholder_secret, stdout)
+        self.assertNotIn(placeholder_secret, stderr)
+        self.assertIn("Empty/invalid QR payload; skipping", stdout)
 
 
 if __name__ == "__main__":
