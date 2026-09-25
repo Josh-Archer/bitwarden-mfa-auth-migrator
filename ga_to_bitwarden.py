@@ -39,8 +39,52 @@ class EmptyPayloadError(MigrationError):
     """QR/URL decoded but migration payload was missing, invalid, or empty."""
 
 
+class ProtobufParseError(ValueError):
+    """Raised when a migration payload cannot be parsed safely."""
+
+
 # Google Authenticator Migration Protobuf Field IDs (Manual Parsing)
 # ... (same protobuf logic as before) ...
+
+
+# Google Authenticator MigrationPayload enum mappings
+# https://github.com/google/google-authenticator-android (MigrationPayload)
+ALGORITHM_MAP = {
+    0: "SHA1",   # ALGORITHM_UNSPECIFIED -> treat as default
+    1: "SHA1",   # ALGORITHM_SHA1
+    2: "SHA256", # ALGORITHM_SHA256
+    3: "SHA512", # ALGORITHM_SHA512
+    4: "MD5",    # ALGORITHM_MD5
+}
+
+DIGITS_MAP = {
+    0: 6,  # DIGIT_COUNT_UNSPECIFIED -> default
+    1: 6,  # DIGIT_COUNT_SIX
+    2: 8,  # DIGIT_COUNT_EIGHT
+}
+
+OTP_TYPE_HOTP = 1
+OTP_TYPE_TOTP = 2
+
+GA_ALGO_MAP = ALGORITHM_MAP
+GA_DIGITS_MAP = DIGITS_MAP
+GA_TYPE_MAP = {
+    0: "totp",  # unspecified -> totp
+    1: "hotp",
+    2: "totp",
+}
+
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".tiff"}
+TEXT_EXTENSIONS = {".txt", ".text", ".uri", ".urls", ".otpauth"}
+JSON_EXTENSIONS = {".json"}
+
+
+
+def otp_type_name(type_val):
+    if type_val == 1:
+        return "hotp"
+    return "totp"
+
 
 def read_varint(data, pos):
     """Read a protobuf varint; raise clear error if truncated mid-value."""
@@ -49,7 +93,10 @@ def read_varint(data, pos):
     start = pos
     while True:
         if pos >= len(data):
-            raise EmptyPayloadError("Truncated protobuf while reading varint")
+            raise ProtobufParseError(
+                f"Truncated varint starting at offset {start} "
+                f"(reached end of {len(data)}-byte buffer)"
+            )
         b = data[pos]
         res |= (b & 0x7f) << shift
         pos += 1
@@ -57,7 +104,50 @@ def read_varint(data, pos):
             return res, pos
         shift += 7
         if shift > 63:
-            raise EmptyPayloadError("Invalid varint in migration payload")
+            raise ProtobufParseError(f"Varint too long at offset {start}")
+
+
+def skip_field(data, pos, wire_type):
+    """
+    Advance past one protobuf field value for any standard wire type.
+    Returns the new position. Raises ProtobufParseError on bounds failures
+    or unsupported/unknown wire types so callers never continue with a
+    desynchronized cursor (critical for multi-batch migration payloads).
+    """
+    if wire_type == 0:  # Varint
+        _, pos = read_varint(data, pos)
+        return pos
+    if wire_type == 1:  # 64-bit
+        if pos + 8 > len(data):
+            raise ProtobufParseError(
+                f"Truncated 64-bit field at offset {pos} "
+                f"(need 8 bytes, {len(data) - pos} remaining)"
+            )
+        return pos + 8
+    if wire_type == 2:  # Length-delimited
+        length, pos = read_varint(data, pos)
+        if length < 0 or pos + length > len(data):
+            raise ProtobufParseError(
+                f"Truncated length-delimited field at offset {pos}: "
+                f"claimed length {length}, {len(data) - pos} bytes remaining"
+            )
+        return pos + length
+    if wire_type == 5:  # 32-bit
+        if pos + 4 > len(data):
+            raise ProtobufParseError(
+                f"Truncated 32-bit field at offset {pos} "
+                f"(need 4 bytes, {len(data) - pos} remaining)"
+            )
+        return pos + 4
+    # Groups (3/4) are deprecated and unused by MigrationPayload
+    if wire_type in (3, 4):
+        raise ProtobufParseError(
+            f"Unsupported deprecated group wire type {wire_type} at offset {pos}"
+        )
+    raise ProtobufParseError(
+        f"Unknown protobuf wire type {wire_type} at offset {pos}"
+    )
+
 
 def parse_otp_parameters(data):
     pos = 0
@@ -106,43 +196,67 @@ def parse_otp_parameters(data):
 
 
 def parse_migration_payload(data):
-    """Parse protobuf MigrationPayload bytes into a list of OTP param dicts.
+    """
+    Parse a Google Authenticator MigrationPayload protobuf.
 
-    Raises EmptyPayloadError if the payload contains no OTP parameters.
+    Handles multi-batch export metadata (version, batch_size, batch_index,
+    batch_id) and any unknown fields by correctly skipping every wire type.
+    Raises EmptyPayloadError if the buffer is empty or contains no OTP entries.
+    Raises ProtobufParseError if the cursor would desynchronize mid-payload.
     """
     if not data:
         raise EmptyPayloadError("Migration payload is empty")
 
     pos = 0
     all_params = []
+    batch_meta = {}
     try:
         while pos < len(data):
             tag, pos = read_varint(data, pos)
             field_number = tag >> 3
             wire_type = tag & 0x07
-            
+
             if wire_type == 2 and field_number == 1:
                 length, pos = read_varint(data, pos)
-                otp_data = data[pos:pos+length]
+                if pos + length > len(data):
+                    raise ProtobufParseError(
+                        f"Truncated otp_parameters entry at offset {pos}: "
+                        f"claimed length {length}, {len(data) - pos} remaining"
+                    )
+                otp_data = data[pos:pos + length]
                 pos += length
                 all_params.append(parse_otp_parameters(otp_data))
-            elif wire_type == 0: # Version, etc.
-                _, pos = read_varint(data, pos)
+            elif wire_type == 0:
+                val, pos = read_varint(data, pos)
+                if field_number == 2:
+                    batch_meta["version"] = val
+                elif field_number == 3:
+                    batch_meta["batch_size"] = val
+                elif field_number == 4:
+                    batch_meta["batch_index"] = val
+                elif field_number == 5:
+                    batch_meta["batch_id"] = val
             else:
-                # Skip or handle other fields
-                if wire_type == 2:
-                    length, pos = read_varint(data, pos)
-                    pos += length
-                elif wire_type == 0:
-                    _, pos = read_varint(data, pos)
-    except (IndexError, struct.error) as e:
-        raise EmptyPayloadError(f"Malformed migration payload: {e}") from e
+                pos = skip_field(data, pos, wire_type)
+    except ProtobufParseError as e:
+        raise ProtobufParseError(
+            f"Migration payload parse failed mid-payload at offset {pos}: {e}"
+        ) from e
+    except EmptyPayloadError:
+        raise
+    except Exception as e:
+        raise ProtobufParseError(
+            f"Migration payload parse failed mid-payload at offset {pos}: {e}"
+        ) from e
 
     if not all_params:
-        raise EmptyPayloadError(
-            "Migration payload decoded but contained no OTP accounts"
-        )
+        raise EmptyPayloadError("Migration payload contained no OTP parameters")
+
+    for params in all_params:
+        if batch_meta:
+            params["_batch"] = dict(batch_meta)
     return all_params
+
 
 def decode_migration_url(url, *, strict=True):
     """Decode an otpauth-migration:// URL into raw protobuf bytes.
@@ -288,9 +402,484 @@ def classify_empty_export(*, has_images, unreadable_images, urls_seen, decode_fa
     )
 
 
-def get_qr_data(image):
-    urls = []
-    
+def normalize_secret_to_bytes(secret):
+    """Accept raw bytes or base32 string; return secret bytes."""
+    if secret is None:
+        return b""
+    if isinstance(secret, (bytes, bytearray)):
+        return bytes(secret)
+    s = str(secret).strip().replace(" ", "").upper()
+    # pad base32
+    pad = (-len(s)) % 8
+    s += "=" * pad
+    try:
+        return base64.b32decode(s, casefold=True)
+    except Exception:
+        # Some exports store hex; try that as a fallback
+        try:
+            return bytes.fromhex(str(secret).strip())
+        except Exception:
+            return b""
+
+def secret_to_b32(secret_bytes):
+    if not secret_bytes:
+        return ""
+    return base64.b32encode(secret_bytes).decode("ascii").rstrip("=")
+
+def make_account(
+    secret,
+    name="",
+    issuer="",
+    algorithm="SHA1",
+    digits=6,
+    otp_type="totp",
+    period=30,
+    counter=0,
+    source="",
+    notes="",
+):
+    secret_bytes = normalize_secret_to_bytes(secret)
+    algo = (algorithm or "SHA1").upper().replace("SHA-1", "SHA1").replace("SHA-256", "SHA256").replace("SHA-512", "SHA512")
+    try:
+        digits = int(digits) if digits not in (None, "") else 6
+    except (TypeError, ValueError):
+        digits = 6
+    try:
+        period = int(period) if period not in (None, "") else 30
+    except (TypeError, ValueError):
+        period = 30
+    try:
+        counter = int(counter) if counter not in (None, "") else 0
+    except (TypeError, ValueError):
+        counter = 0
+    otp_type = (otp_type or "totp").lower()
+    if otp_type in ("1", "hotp"):
+        otp_type = "hotp"
+    else:
+        otp_type = "totp"
+
+    return {
+        "secret": secret_bytes,
+        "name": name or "Unknown",
+        "issuer": issuer or "",
+        "algorithm": algo,
+        "digits": digits,
+        "type": otp_type,
+        "period": period,
+        "counter": counter,
+        "source": source,
+        "notes": notes or "",
+    }
+
+def ga_params_to_account(params):
+    algo = GA_ALGO_MAP.get(params.get("algorithm", 1), "SHA1")
+    digits = GA_DIGITS_MAP.get(params.get("digits", 1), 6)
+    otp_type = GA_TYPE_MAP.get(params.get("type", 2), "totp")
+    return make_account(
+        secret=params.get("secret", b""),
+        name=params.get("name", "Unknown"),
+        issuer=params.get("issuer", ""),
+        algorithm=algo,
+        digits=digits,
+        otp_type=otp_type,
+        counter=params.get("counter", 0),
+        source="google-authenticator",
+        notes="Migrated from Google Authenticator",
+    )
+
+_OTPAUTH_RE = re.compile(r"otpauth://[^\s\"'<>]+", re.IGNORECASE)
+
+_MIGRATION_RE = re.compile(r"otpauth-migration://[^\s\"'<>]+", re.IGNORECASE)
+
+def parse_otpauth_uri(uri):
+    """Parse a single otpauth://totp|hotp URI into a normalized account."""
+    uri = uri.strip()
+    if not uri.lower().startswith("otpauth://"):
+        return None
+
+    parsed = urllib.parse.urlparse(uri)
+    otp_type = parsed.netloc.lower()  # totp or hotp
+    if otp_type not in ("totp", "hotp"):
+        return None
+
+    # Label is path without leading /
+    label = urllib.parse.unquote(parsed.path.lstrip("/"))
+    issuer_from_label = ""
+    name = label
+    if ":" in label:
+        issuer_from_label, name = label.split(":", 1)
+        issuer_from_label = issuer_from_label.strip()
+        name = name.strip()
+
+    query = urllib.parse.parse_qs(parsed.query)
+    secret = (query.get("secret") or [""])[0]
+    if not secret:
+        return None
+
+    issuer = (query.get("issuer") or [issuer_from_label])[0] or issuer_from_label
+    algorithm = (query.get("algorithm") or ["SHA1"])[0]
+    digits = (query.get("digits") or ["6"])[0]
+    period = (query.get("period") or ["30"])[0]
+    counter = (query.get("counter") or ["0"])[0]
+
+    return make_account(
+        secret=secret,
+        name=name or "Unknown",
+        issuer=issuer,
+        algorithm=algorithm,
+        digits=digits,
+        otp_type=otp_type,
+        period=period,
+        counter=counter,
+        source="otpauth-uri",
+        notes="Migrated from otpauth URI",
+    )
+
+def extract_uris_from_text(text):
+    """Return (migration_urls, otpauth_uris) found in free-form text."""
+    migrations = _MIGRATION_RE.findall(text)
+    otpauths = _OTPAUTH_RE.findall(text)
+    # strip trailing punctuation often copied from docs
+    otpauths = [u.rstrip(").,;]") for u in otpauths]
+    migrations = [u.rstrip(").,;]") for u in migrations]
+    return migrations, otpauths
+
+def parse_otpauth_text(text):
+    """Parse all otpauth:// and otpauth-migration:// URIs from text."""
+    accounts = []
+    migrations, otpauths = extract_uris_from_text(text)
+
+    for url in migrations:
+        payload = decode_migration_url(url)
+        if payload:
+            for params in parse_migration_payload(payload):
+                accounts.append(ga_params_to_account(params))
+
+    for uri in otpauths:
+        acct = parse_otpauth_uri(uri)
+        if acct:
+            accounts.append(acct)
+
+    return accounts
+
+def parse_aegis_export(data):
+    """
+    Parse an unencrypted Aegis Authenticator JSON export.
+
+    Expected shape (version 1 file wrapper):
+      { "version": 1, "header": {...}, "db": { "version": 1|2, "entries": [...] } }
+
+    Encrypted exports (header.slots is non-null) are rejected with a clear error.
+    """
+    if isinstance(data, str):
+        data = json.loads(data)
+
+    header = data.get("header") or {}
+    if header.get("slots") is not None:
+        raise ValueError(
+            "Aegis export appears encrypted. Export again with encryption disabled "
+            "(Aegis → Settings → Import & Export → Export → uncheck password)."
+        )
+
+    db = data.get("db")
+    if db is None and "entries" in data:
+        # Some tools dump just the db object
+        db = data
+    if not isinstance(db, dict):
+        raise ValueError("Not a recognized Aegis export (missing 'db' object).")
+
+    entries = db.get("entries")
+    if entries is None:
+        raise ValueError("Not a recognized Aegis export (missing 'db.entries').")
+
+    accounts = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        info = entry.get("info") or {}
+        secret = info.get("secret") or entry.get("secret")
+        if not secret:
+            continue
+        otp_type = (entry.get("type") or "totp").lower()
+        accounts.append(
+            make_account(
+                secret=secret,
+                name=entry.get("name") or "Unknown",
+                issuer=entry.get("issuer") or "",
+                algorithm=info.get("algo") or info.get("algorithm") or "SHA1",
+                digits=info.get("digits", 6),
+                otp_type=otp_type,
+                period=info.get("period", 30),
+                counter=info.get("counter", 0),
+                source="aegis",
+                notes=(entry.get("note") or "") or "Migrated from Aegis",
+            )
+        )
+    return accounts
+
+def is_aegis_export(data):
+    if not isinstance(data, dict):
+        return False
+    if "db" in data and isinstance(data.get("db"), dict) and "entries" in data["db"]:
+        return True
+    # bare db
+    if "entries" in data and isinstance(data.get("entries"), list):
+        # distinguish from Authy list-of-tokens by checking entry shape
+        entries = data["entries"]
+        if entries and isinstance(entries[0], dict) and ("info" in entries[0] or "uuid" in entries[0]):
+            return True
+    return False
+
+def parse_authy_export(data):
+    """
+    Parse common community Authy export JSON shapes.
+
+    Supported:
+      1. { "authenticator_tokens": [ { "name", "issuer", "unique_id",
+            "digits", "decrypted_seed"|"secret"|"seed", ... }, ... ] }
+      2. [ { "name", "secret"|"seed", "issuer"?, "digits"? }, ... ]
+      3. { "tokens": [ ... same as above ... ] }
+
+    Encrypted seeds without a plaintext secret are skipped with a warning count.
+    """
+    if isinstance(data, str):
+        data = json.loads(data)
+
+    tokens = None
+    if isinstance(data, list):
+        tokens = data
+    elif isinstance(data, dict):
+        for key in ("authenticator_tokens", "tokens", "accounts", "items"):
+            if isinstance(data.get(key), list):
+                tokens = data[key]
+                break
+        # single-token object
+        if tokens is None and any(k in data for k in ("secret", "seed", "decrypted_seed")):
+            tokens = [data]
+
+    if tokens is None:
+        raise ValueError(
+            "Not a recognized Authy export. Expected a JSON array of tokens or an "
+            "object with 'authenticator_tokens' / 'tokens'."
+        )
+
+    accounts = []
+    skipped_encrypted = 0
+    for tok in tokens:
+        if not isinstance(tok, dict):
+            continue
+        secret = (
+            tok.get("decrypted_seed")
+            or tok.get("secret")
+            or tok.get("seed")
+            or tok.get("token")
+        )
+        if not secret:
+            if tok.get("encrypted_seed") or tok.get("key"):
+                skipped_encrypted += 1
+            continue
+
+        name = tok.get("name") or tok.get("account_type") or tok.get("label") or "Unknown"
+        issuer = tok.get("issuer") or tok.get("account_type") or ""
+        # Authy often puts service name in name and leaves issuer empty
+        if issuer == name:
+            issuer = ""
+
+        digits = tok.get("digits", 6)
+        # Authy original tokens are often 7 digits
+        if tok.get("original_name") and not tok.get("digits"):
+            digits = 7
+
+        accounts.append(
+            make_account(
+                secret=secret,
+                name=name,
+                issuer=issuer if issuer != name else "",
+                algorithm=tok.get("algorithm") or tok.get("algo") or "SHA1",
+                digits=digits,
+                otp_type=tok.get("type") or "totp",
+                period=tok.get("period") or tok.get("timer") or 30,
+                counter=tok.get("counter", 0),
+                source="authy",
+                notes="Migrated from Authy export",
+            )
+        )
+
+    if skipped_encrypted and not accounts:
+        raise ValueError(
+            f"Found {skipped_encrypted} encrypted Authy token(s) but no plaintext secrets. "
+            "Use a decrypting export tool (e.g. authy-export) and re-run with the decrypted JSON."
+        )
+    if skipped_encrypted:
+        print(f"[Warning] Skipped {skipped_encrypted} encrypted Authy token(s) without plaintext secrets.")
+
+    return accounts
+
+def is_authy_export(data):
+    if isinstance(data, list):
+        if not data:
+            return False
+        first = data[0]
+        if not isinstance(first, dict):
+            return False
+        keys = set(first.keys())
+        return bool(keys & {"decrypted_seed", "encrypted_seed", "secret", "seed", "unique_id"})
+    if isinstance(data, dict):
+        if any(k in data for k in ("authenticator_tokens",)):
+            return True
+        if "tokens" in data and isinstance(data["tokens"], list):
+            return True
+    return False
+
+def build_totp_uri(account):
+    """Build a full otpauth URI (needed when params are non-default)."""
+    secret_b32 = secret_to_b32(account.get("secret", b""))
+    name = account.get("name") or "Unknown"
+    issuer = account.get("issuer") or ""
+    label = f"{issuer}:{name}" if issuer else name
+    label_enc = urllib.parse.quote(label)
+
+    params = {"secret": secret_b32}
+    if issuer:
+        params["issuer"] = issuer
+    algo = (account.get("algorithm") or "SHA1").upper()
+    if algo and algo != "SHA1":
+        params["algorithm"] = algo
+    digits = account.get("digits") or 6
+    if digits and int(digits) != 6:
+        params["digits"] = str(digits)
+    period = account.get("period") or 30
+    otp_type = account.get("type") or "totp"
+    if otp_type == "hotp":
+        params["counter"] = str(account.get("counter") or 0)
+    elif period and int(period) != 30:
+        params["period"] = str(period)
+
+    query = urllib.parse.urlencode(params)
+    return f"otpauth://{otp_type}/{label_enc}?{query}"
+
+def export_bitwarden_csv(accounts, output_file):
+    headers = [
+        "folder", "favorite", "type", "name", "notes", "fields",
+        "login_uri", "login_username", _BW_CSV_EMPTY_LOGIN_COL, "login_totp",
+    ]
+
+    folder_map = {
+        "google-authenticator": "Google Authenticator Migration",
+        "otpauth-uri": "otpauth URI Import",
+        "aegis": "Aegis Migration",
+        "authy": "Authy Migration",
+    }
+
+    with open(output_file, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=headers)
+        writer.writeheader()
+
+        for otp in accounts:
+            secret_b32 = secret_to_b32(otp.get("secret", b""))
+            name = otp.get("name", "Unknown")
+            issuer = otp.get("issuer", "")
+            display_name = f"{issuer}: {name}" if issuer else name
+            source = otp.get("source") or ""
+            folder = folder_map.get(source, "Authenticator Migration")
+
+            # Use full otpauth URI when non-default params so Bitwarden preserves them
+            algo = (otp.get("algorithm") or "SHA1").upper()
+            digits = int(otp.get("digits") or 6)
+            period = int(otp.get("period") or 30)
+            otp_type = otp.get("type") or "totp"
+            non_default = (
+                otp_type != "totp"
+                or algo != "SHA1"
+                or digits != 6
+                or period != 30
+            )
+            login_totp = build_totp_uri(otp) if non_default else secret_b32
+
+            notes = otp.get("notes") or f"Migrated from {source or 'authenticator'}"
+            writer.writerow({
+                "folder": folder,
+                "favorite": "0",
+                "type": "login",
+                "name": display_name,
+                "notes": notes,
+                "login_username": name,
+                "login_totp": login_totp,
+            })
+
+def write_bitwarden_csv(results, output_file):
+    """Write OTP params to a Bitwarden-compatible CSV with full otpauth URIs."""
+    headers = [
+        "folder", "favorite", "type", "name", "notes", "fields",
+        "login_uri", "login_username", _BW_CSV_EMPTY_LOGIN_COL, "login_totp",
+    ]
+    with open(output_file, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=headers)
+        writer.writeheader()
+        for otp in results:
+            name = otp.get("name", "Unknown")
+            issuer = otp.get("issuer", "")
+            display_name = f"{issuer}: {name}" if issuer else name
+            writer.writerow({
+                "folder": "Google Authenticator Migration",
+                "favorite": "0",
+                "type": "login",
+                "name": display_name,
+                "notes": "Migrated from Google Authenticator",
+                "login_username": name,
+                "login_totp": build_otpauth_uri(otp),
+            })
+
+
+# Test/compat aliases for renamed helpers
+def secret_to_base32(secret_bytes):
+    return secret_to_b32(secret_bytes)
+
+
+def build_otpauth_uri(otp):
+    """
+    Build an otpauth:// URI that preserves algorithm, digits, type (and HOTP counter)
+    from a parsed Google Authenticator OtpParameters dict.
+    Bitwarden accepts full otpauth URIs in the login_totp CSV field.
+    """
+    secret_b32 = secret_to_base32(otp.get("secret", b""))
+    name = otp.get("name", "Unknown") or "Unknown"
+    issuer = otp.get("issuer", "") or ""
+    algorithm = ALGORITHM_MAP.get(otp.get("algorithm", 0), "SHA1")
+    digits = DIGITS_MAP.get(otp.get("digits", 0), 6)
+    otp_type = otp_type_name(otp.get("type", 0))
+
+    if issuer:
+        label = f"{issuer}:{name}"
+    else:
+        label = name
+    label_enc = urllib.parse.quote(label, safe="")
+
+    query = {
+        "secret": secret_b32,
+        "algorithm": algorithm,
+        "digits": str(digits),
+    }
+    if issuer:
+        query["issuer"] = issuer
+    if otp_type == "totp":
+        query["period"] = "30"
+    else:
+        query["counter"] = str(otp.get("counter", 0))
+
+    query_str = urllib.parse.urlencode(query, quote_via=urllib.parse.quote)
+    return f"otpauth://{otp_type}/{label_enc}?{query_str}"
+
+def get_qr_payloads(image):
+    """Return raw decoded QR string payloads from an image (any content)."""
+    payloads = []
+    seen = set()
+
+    def _add(text):
+        if text and text not in seen:
+            seen.add(text)
+            payloads.append(text)
+
     # Method 1: PyZbar (Most robust for dense QRs)
     if HAS_ZBAR:
         results = zbar_decode(image)
@@ -542,6 +1131,12 @@ def main(argv=None):
     parser.add_argument("input", nargs='?', help="Path to image file or directory containing QR screenshots")
     parser.add_argument("--live", action="store_true", help="Use webcam for live scanning")
     parser.add_argument(
+        "--format", "-f",
+        choices=["auto", "qr", "ga", "otpauth", "aegis", "authy"],
+        default="auto",
+        help="Input format (default: auto-detect from extension/content)",
+    )
+    parser.add_argument(
         "--output", "-o",
         default=None,
         help="Output CSV file path. Default when not using --import-bw: bitwarden_import.csv. "
@@ -561,6 +1156,57 @@ def main(argv=None):
     except MissingDependencyError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 2
+
+    # Multi-source file loaders for non-QR formats (and auto when not an image).
+    if (
+        not args.live
+        and args.input
+        and (
+            args.format in ("otpauth", "aegis", "authy")
+            or (
+                args.format == "auto"
+                and os.path.isfile(args.input)
+                and Path(args.input).suffix.lower() in (TEXT_EXTENSIONS | JSON_EXTENSIONS)
+            )
+        )
+    ):
+        path = args.input
+        if not os.path.exists(path):
+            print(f"Error: Path not found: {path}", file=sys.stderr)
+            return 1
+        files = []
+        if os.path.isdir(path):
+            for f in sorted(os.listdir(path)):
+                full = os.path.join(path, f)
+                if os.path.isfile(full):
+                    files.append(full)
+        else:
+            files = [path]
+        results = []
+        print(f"Found {len(files)} file(s) to process.")
+        for file_path in files:
+            print(f"\n-- Processing: {os.path.basename(file_path)}")
+            try:
+                accts = load_accounts_from_file(file_path, fmt=args.format, quiet=args.quiet)
+            except Exception as e:
+                print(f"  [Error] {e}")
+                continue
+            if not accts:
+                print("  [!] No accounts found in this file.")
+            else:
+                print(f"  [Success] {len(accts)} account(s) from this file.")
+                results.extend(accts)
+        if not results:
+            print("\nNo accounts extracted.", file=sys.stderr)
+            return 1
+        out = args.output or "bitwarden_import.csv"
+        try:
+            export_bitwarden_csv(results, out)
+            print(f"\nSuccessfully exported {len(results)} accounts to {out}")
+            return 0
+        except Exception as e:
+            print(f"Error writing CSV file: {e}", file=sys.stderr)
+            return 1
 
     results = []
     unreadable_images = 0
