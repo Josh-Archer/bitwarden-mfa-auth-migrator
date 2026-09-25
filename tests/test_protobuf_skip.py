@@ -22,6 +22,7 @@ if ROOT not in sys.path:
 
 from ga_to_bitwarden import (  # noqa: E402
     ProtobufParseError,
+    EmptyPayloadError,
     decode_migration_url,
     parse_migration_payload,
     parse_otp_parameters,
@@ -267,7 +268,8 @@ class TestMultiBatchFixtures(unittest.TestCase):
 
 class TestMigrationPayloadErrors(unittest.TestCase):
     def test_empty_payload(self):
-        self.assertEqual(parse_migration_payload(b""), [])
+        with self.assertRaises(EmptyPayloadError):
+            parse_migration_payload(b"")
 
     def test_garbage_tag_mid_stream_after_valid_account(self):
         otp = encode_otp_parameters(b"\x01" * 8, "x", "Y")
