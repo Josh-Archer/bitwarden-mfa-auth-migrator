@@ -1087,14 +1087,20 @@ def live_scan(quiet=False):
                 if payloads:
                     break
 
-        if detected_urls:
-            for info in detected_urls:
-                if info not in seen_urls:
-                    seen_urls.add(info)
+        if payloads:
+            for info in payloads:
+                if info not in seen_payloads:
+                    seen_payloads.add(info)
                     try:
-                        payload_data = decode_migration_url(info, strict=True)
-                        otp_list = parse_migration_payload(payload_data)
-                    except EmptyPayloadError as e:
+                        if info.lower().startswith("otpauth://"):
+                            acct = parse_otpauth_uri(info)
+                            if not acct:
+                                raise EmptyPayloadError(f"Invalid otpauth URI: {info}")
+                            otp_list = [acct]
+                        else:
+                            payload_data = decode_migration_url(info, strict=True)
+                            otp_list = parse_migration_payload(payload_data)
+                    except (EmptyPayloadError, ProtobufParseError) as e:
                         print(f"  [Error] Empty/invalid migration payload: {e}")
                         continue
 
@@ -1103,10 +1109,10 @@ def live_scan(quiet=False):
                             name = otp.get('name', 'Unknown')
                             issuer = otp.get('issuer', '')
                             print(f"    [Captured] {issuer}: {name}")
-                    
+
                     all_results.extend(otp_list)
                     print(f"  [+] Captured {len(otp_list)} accounts! (Total: {len(all_results)})")
-                    last_capture_time = 60 # Show message for ~2 seconds (at 30fps)
+                    last_capture_time = 60  # Show message for ~2 seconds (at 30fps)
         
         # Draw counts
         cv2.putText(frame, f"Accounts Captured: {len(all_results)}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)

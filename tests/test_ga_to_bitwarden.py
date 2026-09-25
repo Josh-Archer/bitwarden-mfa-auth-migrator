@@ -12,6 +12,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import numpy as np
+
 # Ensure project root is importable when running pytest from repo root
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -206,6 +208,92 @@ class TestErrorHierarchy(unittest.TestCase):
             m.EmptyPayloadError("x"),
         ):
             self.assertIsInstance(exc, m.MigrationError)
+
+
+class TestLiveScan(unittest.TestCase):
+    @mock.patch("cv2.VideoCapture")
+    def test_live_scan_webcam_unavailable(self, mock_vc):
+        mock_cap = mock.MagicMock()
+        mock_cap.isOpened.return_value = False
+        mock_vc.return_value = mock_cap
+
+        results = m.live_scan()
+        self.assertEqual(results, [])
+
+    @mock.patch("cv2.destroyAllWindows")
+    @mock.patch("cv2.imshow")
+    @mock.patch("cv2.waitKey", side_effect=[0, ord("q")])
+    @mock.patch("cv2.VideoCapture")
+    @mock.patch("ga_to_bitwarden.get_qr_payloads")
+    def test_live_scan_captures_and_deduplicates(
+        self, mock_qr, mock_vc, mock_key, mock_show, mock_destroy
+    ):
+        mock_cap = mock.MagicMock()
+        mock_cap.isOpened.return_value = True
+        fake_frame = np.zeros((50, 50, 3), dtype=np.uint8)
+        mock_cap.read.return_value = (True, fake_frame)
+        mock_vc.return_value = mock_cap
+
+        payload, _ = sample_accounts_payload()
+        mig_url = migration_url_from_payload(payload)
+        otpauth_uri = (
+            "otpauth://totp/Example:user?secret=EXAMPLENOTREALAA&issuer=Example"
+        )
+
+        # Frame 1: mig_url and otpauth_uri. Frame 2: duplicate mig_url.
+        mock_qr.side_effect = [[mig_url, otpauth_uri], [mig_url]]
+
+        results = m.live_scan(quiet=False)
+        self.assertEqual(len(results), 3)
+        mock_cap.release.assert_called_once()
+        mock_destroy.assert_called_once()
+
+    @mock.patch("cv2.destroyAllWindows")
+    @mock.patch("cv2.imshow")
+    @mock.patch("cv2.waitKey", side_effect=[ord("q")])
+    @mock.patch("cv2.VideoCapture")
+    @mock.patch("ga_to_bitwarden.get_qr_payloads")
+    def test_live_scan_handles_invalid_payloads_without_error(
+        self, mock_qr, mock_vc, mock_key, mock_show, mock_destroy
+    ):
+        mock_cap = mock.MagicMock()
+        mock_cap.isOpened.return_value = True
+        fake_frame = np.zeros((50, 50, 3), dtype=np.uint8)
+        mock_cap.read.return_value = (True, fake_frame)
+        mock_vc.return_value = mock_cap
+
+        mock_qr.return_value = [
+            "otpauth-migration://offline?data=",
+            "https://example.com",
+        ]
+        results = m.live_scan(quiet=True)
+        self.assertEqual(results, [])
+
+    @mock.patch("cv2.destroyAllWindows")
+    @mock.patch("cv2.imshow")
+    @mock.patch("cv2.waitKey", side_effect=[ord("q")])
+    @mock.patch("cv2.VideoCapture")
+    @mock.patch("ga_to_bitwarden.get_qr_payloads")
+    def test_live_scan_quiet_suppresses_captured_output(
+        self, mock_qr, mock_vc, mock_key, mock_show, mock_destroy
+    ):
+        mock_cap = mock.MagicMock()
+        mock_cap.isOpened.return_value = True
+        fake_frame = np.zeros((50, 50, 3), dtype=np.uint8)
+        mock_cap.read.return_value = (True, fake_frame)
+        mock_vc.return_value = mock_cap
+
+        otpauth_uri = (
+            "otpauth://totp/Example:user?secret=EXAMPLENOTREALAA&issuer=Example"
+        )
+        mock_qr.return_value = [otpauth_uri]
+
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as mock_out:
+            results = m.live_scan(quiet=True)
+            output = mock_out.getvalue()
+
+        self.assertEqual(len(results), 1)
+        self.assertNotIn("[Captured]", output)
 
 
 if __name__ == "__main__":
