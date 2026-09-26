@@ -912,7 +912,7 @@ def accounts_from_qr_payloads(payloads):
         payload = (payload or "").strip()
         if not payload:
             continue
-        if payload.startswith("otpauth-migration://"):
+        if payload.lower().startswith("otpauth-migration://"):
             data = decode_migration_url(payload)
             if data:
                 for params in parse_migration_payload(data):
@@ -1087,15 +1087,17 @@ def live_scan(quiet=False):
                 if payloads:
                     break
 
-        if detected_urls:
-            for info in detected_urls:
-                if info not in seen_urls:
-                    seen_urls.add(info)
+        if payloads:
+            for info in payloads:
+                if info not in seen_payloads:
+                    seen_payloads.add(info)
                     try:
-                        payload_data = decode_migration_url(info, strict=True)
-                        otp_list = parse_migration_payload(payload_data)
-                    except EmptyPayloadError as e:
-                        print(f"  [Error] Empty/invalid migration payload: {e}")
+                        otp_list = accounts_from_qr_payloads([info])
+                        if not otp_list:
+                            print("  [Error] Empty/invalid QR payload; skipping")
+                            continue
+                    except (EmptyPayloadError, ProtobufParseError):
+                        print("  [Error] Empty/invalid QR payload; skipping")
                         continue
 
                     if not quiet:
@@ -1103,14 +1105,14 @@ def live_scan(quiet=False):
                             name = otp.get('name', 'Unknown')
                             issuer = otp.get('issuer', '')
                             print(f"    [Captured] {issuer}: {name}")
-                    
+
                     all_results.extend(otp_list)
                     print(f"  [+] Captured {len(otp_list)} accounts! (Total: {len(all_results)})")
-                    last_capture_time = 60 # Show message for ~2 seconds (at 30fps)
-        
+                    last_capture_time = 60  # Show message for ~2 seconds (at 30fps)
+
         # Draw counts
         cv2.putText(frame, f"Accounts Captured: {len(all_results)}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        
+
         if last_capture_time > 0:
             cv2.putText(
                 frame, "SUCCESSFULLY SCANNED!",
