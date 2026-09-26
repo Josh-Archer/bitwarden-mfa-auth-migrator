@@ -550,13 +550,10 @@ def parse_otpauth_text(text):
     migrations, otpauths = extract_uris_from_text(text)
 
     for url in migrations:
-        try:
-            payload = decode_migration_url(url)
-            if payload:
-                for params in parse_migration_payload(payload):
-                    accounts.append(ga_params_to_account(params))
-        except (EmptyPayloadError, ProtobufParseError):
-            pass
+        payload = decode_migration_url(url)
+        if payload:
+            for params in parse_migration_payload(payload):
+                accounts.append(ga_params_to_account(params))
 
     for uri in otpauths:
         acct = parse_otpauth_uri(uri)
@@ -915,21 +912,18 @@ def accounts_from_qr_payloads(payloads):
         payload = (payload or "").strip()
         if not payload:
             continue
-        try:
-            if payload.lower().startswith("otpauth-migration://"):
-                data = decode_migration_url(payload)
-                if data:
-                    for params in parse_migration_payload(data):
-                        accounts.append(ga_params_to_account(params))
-            elif payload.lower().startswith("otpauth://"):
-                acct = parse_otpauth_uri(payload)
-                if acct:
-                    accounts.append(acct)
-            else:
-                # free text that might embed URIs
-                accounts.extend(parse_otpauth_text(payload))
-        except (EmptyPayloadError, ProtobufParseError):
-            pass
+        if payload.lower().startswith("otpauth-migration://"):
+            data = decode_migration_url(payload)
+            if data:
+                for params in parse_migration_payload(data):
+                    accounts.append(ga_params_to_account(params))
+        elif payload.lower().startswith("otpauth://"):
+            acct = parse_otpauth_uri(payload)
+            if acct:
+                accounts.append(acct)
+        else:
+            # free text that might embed URIs
+            accounts.extend(parse_otpauth_text(payload))
     return accounts
 
 
@@ -1099,10 +1093,10 @@ def live_scan(quiet=False):
                     seen_payloads.add(info)
                     try:
                         otp_list = accounts_from_qr_payloads([info])
+                        if not otp_list:
+                            print("  [Error] Empty/invalid QR payload; skipping")
+                            continue
                     except (EmptyPayloadError, ProtobufParseError):
-                        otp_list = []
-
-                    if not otp_list:
                         print("  [Error] Empty/invalid QR payload; skipping")
                         continue
 

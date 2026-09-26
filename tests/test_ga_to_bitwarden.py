@@ -328,6 +328,89 @@ class TestLiveScan(unittest.TestCase):
         self.assertNotIn(placeholder_secret, stderr)
         self.assertIn("Empty/invalid QR payload; skipping", stdout)
 
+    @mock.patch("cv2.destroyAllWindows")
+    @mock.patch("cv2.imshow")
+    @mock.patch("cv2.waitKey", side_effect=[ord("q")])
+    @mock.patch("cv2.VideoCapture")
+    @mock.patch("ga_to_bitwarden.get_qr_payloads")
+    def test_live_scan_does_not_leak_secret_on_corrupt_migration_payload(
+        self, mock_qr, mock_vc, mock_key, mock_show, mock_destroy
+    ):
+        mock_cap = mock.MagicMock()
+        mock_cap.isOpened.return_value = True
+        fake_frame = np.zeros((50, 50, 3), dtype=np.uint8)
+        mock_cap.read.return_value = (True, fake_frame)
+        mock_vc.return_value = mock_cap
+
+        placeholder_secret = "EXAMPLENOTREALAA"
+        corrupt_uri = (
+            "otpauth-migration://offline?data=corrupted"
+            f"&secret={placeholder_secret}"
+        )
+        mock_qr.return_value = [corrupt_uri]
+
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as mock_out:
+            with mock.patch(
+                "sys.stderr", new_callable=io.StringIO
+            ) as mock_err:
+                results = m.live_scan(quiet=False)
+                stdout = mock_out.getvalue()
+                stderr = mock_err.getvalue()
+
+        self.assertEqual(results, [])
+        self.assertNotIn(placeholder_secret, stdout)
+        self.assertNotIn(placeholder_secret, stderr)
+        self.assertIn("Empty/invalid QR payload; skipping", stdout)
+
+
+class TestNonLivePathsMalformedPayload(unittest.TestCase):
+    def test_accounts_from_qr_payloads_raises_on_empty_migration_payload(self):
+        with self.assertRaises(m.EmptyPayloadError):
+            m.accounts_from_qr_payloads(["otpauth-migration://offline?data="])
+
+    def test_accounts_from_qr_payloads_raises_on_corrupt_protobuf(self):
+        with self.assertRaises((m.EmptyPayloadError, m.ProtobufParseError)):
+            m.accounts_from_qr_payloads(
+                ["otpauth-migration://offline?data=AQIDBA=="]
+            )
+
+    def test_parse_otpauth_text_raises_on_malformed_migration_payload(self):
+        with self.assertRaises(m.EmptyPayloadError):
+            m.parse_otpauth_text("otpauth-migration://offline?data=")
+
+    @mock.patch("ga_to_bitwarden.get_qr_payloads")
+    @mock.patch("cv2.imread")
+    def test_load_accounts_from_image_raises_on_malformed_migration(
+        self, mock_imread, mock_qr
+    ):
+        mock_imread.return_value = np.zeros((50, 50, 3), dtype=np.uint8)
+        mock_qr.return_value = ["otpauth-migration://offline?data="]
+        with self.assertRaises(m.EmptyPayloadError):
+            m.load_accounts_from_image("dummy_screenshot.png")
+
+    @mock.patch("ga_to_bitwarden.get_qr_payloads")
+    @mock.patch("cv2.imread")
+    def test_load_accounts_from_file_qr_raises_on_malformed_migration(
+        self, mock_imread, mock_qr
+    ):
+        mock_imread.return_value = np.zeros((50, 50, 3), dtype=np.uint8)
+        mock_qr.return_value = ["otpauth-migration://offline?data="]
+        with self.assertRaises(m.EmptyPayloadError):
+            m.load_accounts_from_file("dummy.png", fmt="qr")
+
+    def test_load_accounts_from_file_text_raises_on_malformed_migration(self):
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".txt", delete=False
+        ) as f:
+            f.write("otpauth-migration://offline?data=\n")
+            f.flush()
+            temp_path = f.name
+        try:
+            with self.assertRaises(m.EmptyPayloadError):
+                m.load_accounts_from_file(temp_path, fmt="otpauth")
+        finally:
+            os.unlink(temp_path)
+
 
 if __name__ == "__main__":
     unittest.main()
