@@ -205,6 +205,30 @@ class TestCliEndToEnd(unittest.TestCase):
                 rows = list(csv.DictReader(f))
             self.assertEqual(len(rows), 2)
 
+    def test_cli_default_output_no_output_flag(self):
+        with tempfile.TemporaryDirectory() as td:
+            orig_cwd = os.getcwd()
+            try:
+                os.chdir(td)
+                rc = m.main([str(FIXTURES / "otpauth_uris.txt"), "-q"])
+                self.assertEqual(rc, 0)
+                csv_path = Path(td) / "bitwarden_import.csv"
+                self.assertTrue(csv_path.exists())
+                with open(csv_path, newline="", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    self.assertEqual(reader.fieldnames, m.CSV_HEADERS)
+                    rows = list(reader)
+                self.assertGreaterEqual(len(rows), 2)
+                for row in rows:
+                    totp = row["login_totp"]
+                    self.assertTrue(
+                        totp.startswith("otpauth://")
+                        or bool(base64.b32decode(totp, casefold=True)),
+                        f"Expected valid login_totp row, got: {totp}",
+                    )
+            finally:
+                os.chdir(orig_cwd)
+
 
 if __name__ == "__main__":
     unittest.main()

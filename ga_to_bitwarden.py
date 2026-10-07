@@ -306,11 +306,15 @@ def decode_migration_url(url, *, strict=True):
 
 def otp_to_csv_row(otp):
     """Convert a parsed OTP params dict to a Bitwarden CSV row dict."""
-    secret = otp.get('secret', b'') or b''
-    secret_b32 = base64.b32encode(secret).decode().strip('=')
     name = otp.get('name', 'Unknown') or 'Unknown'
     issuer = otp.get('issuer', '') or ''
     display_name = f"{issuer}: {name}" if issuer else name
+
+    existing_totp = otp.get("login_totp")
+    if isinstance(existing_totp, str) and existing_totp.startswith("otpauth://"):
+        login_totp = existing_totp
+    else:
+        login_totp = build_otpauth_uri(otp)
 
     # Empty login password column is emitted via DictWriter defaults (restval).
     return {
@@ -322,7 +326,7 @@ def otp_to_csv_row(otp):
         "fields": "",
         "login_uri": "",
         "login_username": name,
-        "login_totp": secret_b32,
+        "login_totp": login_totp,
     }
 
 
@@ -424,6 +428,8 @@ def normalize_secret_to_bytes(secret):
 def secret_to_b32(secret_bytes):
     if not secret_bytes:
         return ""
+    if isinstance(secret_bytes, str):
+        secret_bytes = normalize_secret_to_bytes(secret_bytes)
     return base64.b32encode(secret_bytes).decode("ascii").rstrip("=")
 
 def make_account(
@@ -794,7 +800,11 @@ def export_bitwarden_csv(accounts, output_file):
                 or digits != 6
                 or period != 30
             )
-            login_totp = build_totp_uri(otp) if non_default else secret_b32
+            if non_default:
+                login_totp = build_totp_uri(otp)
+            else:
+                pad = (-len(secret_b32)) % 8
+                login_totp = secret_b32 + ("=" * pad)
 
             notes = otp.get("notes") or f"Migrated from {source or 'authenticator'}"
             writer.writerow({
@@ -845,9 +855,34 @@ def build_otpauth_uri(otp):
     secret_b32 = secret_to_base32(otp.get("secret", b""))
     name = otp.get("name", "Unknown") or "Unknown"
     issuer = otp.get("issuer", "") or ""
-    algorithm = ALGORITHM_MAP.get(otp.get("algorithm", 0), "SHA1")
-    digits = DIGITS_MAP.get(otp.get("digits", 0), 6)
-    otp_type = otp_type_name(otp.get("type", 0))
+
+    algo_raw = otp.get("algorithm", 0)
+    if isinstance(algo_raw, int) and algo_raw in ALGORITHM_MAP:
+        algorithm = ALGORITHM_MAP[algo_raw]
+    elif isinstance(algo_raw, str) and algo_raw:
+        algorithm = (
+            algo_raw.upper()
+            .replace("SHA-1", "SHA1")
+            .replace("SHA-256", "SHA256")
+            .replace("SHA-512", "SHA512")
+        )
+    else:
+        algorithm = "SHA1"
+
+    digits_raw = otp.get("digits", 0)
+    if digits_raw in DIGITS_MAP:
+        digits = DIGITS_MAP[digits_raw]
+    else:
+        try:
+            digits = int(digits_raw) if digits_raw else 6
+        except (TypeError, ValueError):
+            digits = 6
+
+    type_raw = otp.get("type", 0)
+    if type_raw in (OTP_TYPE_HOTP, "1", "hotp"):
+        otp_type = "hotp"
+    else:
+        otp_type = "totp"
 
     if issuer:
         label = f"{issuer}:{name}"
@@ -863,9 +898,10 @@ def build_otpauth_uri(otp):
     if issuer:
         query["issuer"] = issuer
     if otp_type == "totp":
-        query["period"] = "30"
+        period = otp.get("period") or 30
+        query["period"] = str(period)
     else:
-        query["counter"] = str(otp.get("counter", 0))
+        query["counter"] = str(otp.get("counter", 0) or 0)
 
     query_str = urllib.parse.urlencode(query, quote_via=urllib.parse.quote)
     return f"otpauth://{otp_type}/{label_enc}?{query_str}"
@@ -1140,8 +1176,9 @@ def main(argv=None):
     )
     parser.add_argument(
         "--output", "-o",
-        default=None,
-        help="Output CSV file path. Default when not using --import-bw: bitwarden_import.csv. "
+        default="bitwarden_import.csv",
+        help="Output CSV file path (default: bitwarden_import.csv). "
+             "Default when not using --import-bw: bitwarden_import.csv. "
              "With --import-bw, CSV is not written unless -o is set.",
     )
     parser.add_argument("--quiet", "-q", action="store_true", help="Do not print account names/PII to console")
@@ -1338,7 +1375,7 @@ def main(argv=None):
             return 1
         return 3
 
-    output_file = args.output
+    output_file = args.output or "bitwarden_import.csv"
     
     try:
         count = export_accounts_to_csv(results, output_file)
