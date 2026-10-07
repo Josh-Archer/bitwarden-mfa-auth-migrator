@@ -97,9 +97,15 @@ class TestExportAccountsToCsv(unittest.TestCase):
             self.assertEqual(rows[0]["folder"], "Google Authenticator Migration")
             self.assertEqual(rows[0]["name"], "GitHub: user@example.com")
             self.assertEqual(rows[0]["login_username"], "user@example.com")
-            # TOTP is base32 of secret without padding
-            secret_b32 = base64.b32encode(expected[0]["secret"]).decode().strip("=")
-            self.assertEqual(rows[0]["login_totp"], secret_b32)
+            # TOTP is full importable otpauth:// URI
+            secret_b32 = base64.b32encode(
+                expected[0]["secret"]
+            ).decode().strip("=")
+            self.assertEqual(
+                rows[0]["login_totp"], m.build_otpauth_uri(accounts[0])
+            )
+            self.assertTrue(rows[0]["login_totp"].startswith("otpauth://totp/"))
+            self.assertIn(f"secret={secret_b32}", rows[0]["login_totp"])
             self.assertEqual(rows[1]["name"], "Example Corp: alice")
 
     def test_export_empty_raises(self):
@@ -114,6 +120,8 @@ class TestExportAccountsToCsv(unittest.TestCase):
         row = m.otp_to_csv_row({"secret": b"abc", "name": "only-name"})
         self.assertEqual(row["name"], "only-name")
         self.assertEqual(row["login_username"], "only-name")
+        self.assertTrue(row["login_totp"].startswith("otpauth://totp/only-name?"))
+        self.assertIn("secret=MFRGG", row["login_totp"])
 
 
 class TestDistinctErrorClassification(unittest.TestCase):
@@ -410,6 +418,89 @@ class TestNonLivePathsMalformedPayload(unittest.TestCase):
                 m.load_accounts_from_file(temp_path, fmt="otpauth")
         finally:
             os.unlink(temp_path)
+
+
+class TestCliEndToEndFixtureDefaultOutput(unittest.TestCase):
+    def test_main_fixture_no_output_in_temp_cwd(self):
+        fixture_path = ROOT / "tests" / "fixtures" / "otpauth_uris.txt"
+        with tempfile.TemporaryDirectory() as td:
+            orig_cwd = os.getcwd()
+            try:
+                os.chdir(td)
+                rc = m.main([str(fixture_path), "-q"])
+                self.assertEqual(rc, 0)
+                csv_path = Path(td) / "bitwarden_import.csv"
+                self.assertTrue(csv_path.exists())
+                with open(csv_path, newline="", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    self.assertEqual(reader.fieldnames, m.CSV_HEADERS)
+                    rows = list(reader)
+                self.assertGreaterEqual(len(rows), 2)
+                for row in rows:
+                    totp = row["login_totp"]
+                    self.assertTrue(
+                        totp.startswith("otpauth://")
+                        or bool(base64.b32decode(totp, casefold=True)),
+                        f"Expected valid login_totp row, got: {totp}",
+                    )
+            finally:
+                os.chdir(orig_cwd)
+
+    def test_main_ga_migration_fixture_no_output_in_temp_cwd(self):
+        fixture_path = ROOT / "tests" / "fixtures" / "multi_batch_urls.txt"
+        with tempfile.TemporaryDirectory() as td:
+            orig_cwd = os.getcwd()
+            try:
+                os.chdir(td)
+                rc = m.main([str(fixture_path), "-q"])
+                self.assertEqual(rc, 0)
+                csv_path = Path(td) / "bitwarden_import.csv"
+                self.assertTrue(csv_path.exists())
+                with open(csv_path, newline="", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    self.assertEqual(reader.fieldnames, m.CSV_HEADERS)
+                    rows = list(reader)
+                self.assertEqual(len(rows), 3)
+                for row in rows:
+                    totp = row["login_totp"]
+                    self.assertTrue(
+                        totp.startswith("otpauth://")
+                        or bool(base64.b32decode(totp, casefold=True)),
+                        f"Expected valid login_totp row, got: {totp}",
+                    )
+            finally:
+                os.chdir(orig_cwd)
+
+    @mock.patch("ga_to_bitwarden.live_scan")
+    def test_main_live_scan_successful_decode_writes_csv(self, mock_live):
+        mock_live.return_value = [
+            {
+                "secret": b"\x01\x02\x03\x04\x05\x06\x07\x08\t\n",
+                "name": "live-user@example.com",
+                "issuer": "LiveService",
+                "algorithm": 1,
+                "digits": 1,
+                "type": 2,
+            }
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            orig_cwd = os.getcwd()
+            try:
+                os.chdir(td)
+                rc = m.main(["--live", "-q"])
+                self.assertEqual(rc, 0)
+                csv_path = Path(td) / "bitwarden_import.csv"
+                self.assertTrue(csv_path.exists())
+                with open(csv_path, newline="", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    self.assertEqual(reader.fieldnames, m.CSV_HEADERS)
+                    rows = list(reader)
+                self.assertEqual(len(rows), 1)
+                self.assertTrue(
+                    rows[0]["login_totp"].startswith("otpauth://totp/")
+                )
+            finally:
+                os.chdir(orig_cwd)
 
 
 if __name__ == "__main__":
