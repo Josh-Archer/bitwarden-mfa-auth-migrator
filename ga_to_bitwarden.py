@@ -1176,10 +1176,8 @@ def main(argv=None):
     )
     parser.add_argument(
         "--output", "-o",
-        default="bitwarden_import.csv",
-        help="Output CSV file path (default: bitwarden_import.csv). "
-             "Default when not using --import-bw: bitwarden_import.csv. "
-             "With --import-bw, CSV is not written unless -o is set.",
+        default=None,
+        help="Output CSV file path (default: bitwarden_import.csv)",
     )
     parser.add_argument("--quiet", "-q", action="store_true", help="Do not print account names/PII to console")
     parser.add_argument(
