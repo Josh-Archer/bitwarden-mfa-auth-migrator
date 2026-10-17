@@ -1128,8 +1128,8 @@ def detect_format(path, explicit=None):
             # JSON might be a list of otpauth strings
             if isinstance(data, list) and data and isinstance(data[0], str) and "otpauth" in data[0]:
                 return "otpauth"
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            pass
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+            return "json-corrupt"
         return "json-unknown"
     # try content sniff for extensionless / .csv etc.
     try:
@@ -1174,6 +1174,9 @@ def load_accounts_from_file(path, fmt="auto", quiet=False):
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         return parse_authy_export(data, quiet=quiet)
+    if fmt == "json-corrupt":
+        with open(path, "r", encoding="utf-8") as f:
+            json.load(f)
     if fmt == "json-unknown":
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -1182,18 +1185,23 @@ def load_accounts_from_file(path, fmt="auto", quiet=False):
             return parse_aegis_export(data, quiet=quiet)
         if is_authy_export(data):
             return parse_authy_export(data, quiet=quiet)
+        if quiet:
+            raise ValueError("Unrecognized JSON export format")
         raise ValueError(f"Unrecognized JSON export format: {path}")
     if fmt == "ga" or fmt == "google":
         # force GA migration QR path
         return load_accounts_from_image(path, quiet=quiet)
 
+    if quiet:
+        raise ValueError("Could not detect format. Use --format otpauth|aegis|authy|qr")
     raise ValueError(f"Could not detect format for: {path}. Use --format otpauth|aegis|authy|qr")
 
 
 def load_accounts_from_image(path, quiet=False):
     img = cv2.imread(path)
     if img is None:
-        print(f"  [Error] Could not read image: {path}")
+        label = "image" if quiet else path
+        print(f"  [Error] Could not read image: {label}", file=sys.stderr)
         return []
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -1367,30 +1375,60 @@ def main(argv=None):
             files = [path]
         results = []
         file_errors = []
+        has_corrupt_json = False
         print(f"Found {len(files)} file(s) to process.")
-        for file_path in files:
-            print(f"\n-- Processing: {os.path.basename(file_path)}")
+        for idx, file_path in enumerate(files, 1):
+            file_label = f"file #{idx}" if args.quiet else os.path.basename(file_path)
+            print(f"\n-- Processing: {file_label}")
             if is_directory and args.format == "auto":
                 detected = detect_format(file_path)
                 if detected in ("auto", "json-unknown"):
-                    print("  [Warning] Skipping an unsupported file format.")
+                    print("  [Warning] Skipping an unsupported file format.", file=sys.stderr)
                     continue
+            else:
+                detected = detect_format(file_path, args.format)
+
             try:
                 accts = load_accounts_from_file(file_path, fmt=args.format, quiet=args.quiet)
             except Exception as e:  # noqa: BLE001 - parser failures vary by source format
-                print(f"  [Error] {e}")
-                file_errors.append((file_path, str(e)))
+                err_msg = str(e)
+                if args.quiet:
+                    err_msg = err_msg.replace(file_path, file_label).replace(os.path.basename(file_path), file_label)
+                print(f"  [Error] {err_msg}", file=sys.stderr)
+                is_corrupt = (
+                    isinstance(e, (json.JSONDecodeError, UnicodeDecodeError))
+                    or detected == "json-corrupt"
+                )
+                if is_corrupt:
+                    has_corrupt_json = True
+                file_errors.append((file_path, idx, err_msg))
                 continue
             if not accts:
                 print("  [!] No accounts found in this file.")
             else:
                 print(f"  [Success] {len(accts)} account(s) from this file.")
                 results.extend(accts)
+
+        failed_labels = [
+            f"file #{idx}" if args.quiet else os.path.basename(fp)
+            for fp, idx, _ in file_errors
+        ]
+        failed_str = ", ".join(failed_labels)
+
+        if has_corrupt_json:
+            print(
+                f"\nImport failed: {len(file_errors)} file(s) had errors: {failed_str}; "
+                "no CSV was written.",
+                file=sys.stderr,
+            )
+            return 1
+
         if results:
             out = args.output or "bitwarden_import.csv"
             try:
                 export_bitwarden_csv(results, out, folder=args.bw_folder, quiet=args.quiet)
-                print(f"\nSuccessfully exported {len(results)} accounts to {out}")
+                if not file_errors:
+                    print(f"\nSuccessfully exported {len(results)} accounts to {out}")
             except Exception as e:  # noqa: BLE001 - CSV serialization may raise multiple errors
                 print(f"Error writing CSV file: {e}", file=sys.stderr)
                 return 1
@@ -1398,13 +1436,15 @@ def main(argv=None):
         if file_errors:
             if not results:
                 print(
-                    f"\nImport failed: {len(file_errors)} file(s) had errors; "
+                    f"\nImport failed: {len(file_errors)} file(s) had errors: {failed_str}; "
                     "no CSV was written.",
                     file=sys.stderr,
                 )
             else:
+                out = args.output or "bitwarden_import.csv"
+                print(f"\n{out} is PARTIAL: excludes {failed_str}", file=sys.stderr)
                 print(
-                    f"\nImport finished with errors: {len(file_errors)} file(s) had errors.",
+                    f"Import finished with errors: {len(file_errors)} file(s) had errors: {failed_str}.",
                     file=sys.stderr,
                 )
             return 1
@@ -1475,11 +1515,12 @@ def main(argv=None):
                 file=sys.stderr,
             )
 
-        for image_path in image_files:
-            print(f"\n-- Processing: {os.path.basename(image_path)}")
+        for idx, image_path in enumerate(image_files, 1):
+            image_label = f"file #{idx}" if args.quiet else os.path.basename(image_path)
+            print(f"\n-- Processing: {image_label}")
             img = cv2.imread(image_path)
             if img is None:
-                print("  [Error] Could not read image (unreadable or unsupported format).")
+                print("  [Error] Could not read image (unreadable or unsupported format).", file=sys.stderr)
                 unreadable_images += 1
                 continue
 
@@ -1511,7 +1552,7 @@ def main(argv=None):
                                 otp_list = parse_migration_payload(payload_data)
                             except EmptyPayloadError as e:
                                 decode_failures += 1
-                                print(f"  [Error] Empty/invalid migration payload: {e}")
+                                print(f"  [Error] Empty/invalid migration payload: {e}", file=sys.stderr)
                                 continue
 
                             if not args.quiet:
