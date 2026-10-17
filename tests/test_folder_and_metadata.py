@@ -243,7 +243,7 @@ class TestCliFolderFlag(unittest.TestCase):
             self.assertEqual(rc, 0)
             with open(out, newline="", encoding="utf-8") as f:
                 rows = list(csv.DictReader(f))
-        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(rows), 3)
         for row in rows:
             self.assertEqual(row["folder"], "")
             for column in METADATA_COLUMNS:

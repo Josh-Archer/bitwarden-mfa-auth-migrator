@@ -23,6 +23,7 @@ DEMO_SECRET_B32 = "EXAMPLENOTREALAA"
 DEMO_SECRET_BYTES = base64.b32decode(DEMO_SECRET_B32)
 
 DEMO_SECRET_B32_2 = "EXAMPLENOTREALBB"
+DEMO_SECRET_B32_3 = "EXAMPLENOTREALCC"
 
 
 class TestOtpauthUri(unittest.TestCase):
@@ -46,6 +47,14 @@ class TestOtpauthUri(unittest.TestCase):
         self.assertEqual(acct["algorithm"], "SHA256")
         self.assertEqual(acct["digits"], 8)
         self.assertEqual(acct["period"], 60)
+
+    def test_fixture_hotp(self):
+        accounts = m.parse_otpauth_text((FIXTURES / "otpauth_uris.txt").read_text())
+        hotp = next(a for a in accounts if a["type"] == "hotp")
+        self.assertEqual(hotp["issuer"], "Example HOTP")
+        self.assertEqual(hotp["algorithm"], "SHA512")
+        self.assertEqual(hotp["digits"], 8)
+        self.assertEqual(hotp["counter"], 5)
 
     def test_hotp(self):
         uri = f"otpauth://hotp/Counter:acct?secret={DEMO_SECRET_B32}&counter=3&issuer=Counter"
@@ -82,12 +91,17 @@ class TestAegis(unittest.TestCase):
             data = json.load(f)
         self.assertTrue(m.is_aegis_export(data))
         accounts = m.parse_aegis_export(data)
-        self.assertEqual(len(accounts), 2)
+        self.assertEqual(len(accounts), 3)
         by_issuer = {a["issuer"]: a for a in accounts}
         self.assertIn("Example", by_issuer)
         self.assertEqual(m.secret_to_b32(by_issuer["Example"]["secret"]), DEMO_SECRET_B32)
         self.assertEqual(by_issuer["GitHub"]["digits"], 8)
         self.assertEqual(by_issuer["GitHub"]["algorithm"], "SHA256")
+        hotp = by_issuer["Example HOTP"]
+        self.assertEqual(hotp["type"], "hotp")
+        self.assertEqual(hotp["algorithm"], "SHA512")
+        self.assertEqual(hotp["counter"], 5)
+        self.assertEqual(m.secret_to_b32(hotp["secret"]), DEMO_SECRET_B32_3)
         self.assertEqual(accounts[0]["source"], "aegis")
 
     def test_encrypted_rejected(self):
@@ -113,8 +127,12 @@ class TestAuthy(unittest.TestCase):
             data = json.load(f)
         self.assertTrue(m.is_authy_export(data))
         accounts = m.parse_authy_export(data)
-        self.assertEqual(len(accounts), 2)
+        self.assertEqual(len(accounts), 3)
         self.assertEqual(accounts[0]["source"], "authy")
+        hotp = next(a for a in accounts if a["type"] == "hotp")
+        self.assertEqual(hotp["counter"], 5)
+        self.assertEqual(hotp["algorithm"], "SHA512")
+        self.assertEqual(m.secret_to_b32(hotp["secret"]), DEMO_SECRET_B32_3)
         secrets = {m.secret_to_b32(a["secret"]) for a in accounts}
         self.assertIn(DEMO_SECRET_B32, secrets)
 
@@ -194,7 +212,7 @@ class TestCliEndToEnd(unittest.TestCase):
             self.assertEqual(rc, 0)
             with open(out, newline="", encoding="utf-8") as f:
                 rows = list(csv.DictReader(f))
-            self.assertEqual(len(rows), 2)
+            self.assertEqual(len(rows), 3)
 
     def test_cli_authy_fixture(self):
         with tempfile.TemporaryDirectory() as td:
@@ -203,7 +221,30 @@ class TestCliEndToEnd(unittest.TestCase):
             self.assertEqual(rc, 0)
             with open(out, newline="", encoding="utf-8") as f:
                 rows = list(csv.DictReader(f))
-            self.assertEqual(len(rows), 2)
+            self.assertEqual(len(rows), 3)
+
+    def test_cli_exports_hotp_metadata_for_each_source(self):
+        fixtures = [
+            ("aegis_export.json", "Aegis Migration"),
+            ("authy_export.json", "Authy Migration"),
+            ("otpauth_uris.txt", "otpauth URI Import"),
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            for filename, folder in fixtures:
+                with self.subTest(filename=filename):
+                    out = os.path.join(td, filename + ".csv")
+                    rc = m.main([str(FIXTURES / filename), "-o", out, "-q"])
+                    self.assertEqual(rc, 0)
+                    with open(out, newline="", encoding="utf-8") as f:
+                        rows = list(csv.DictReader(f))
+                    row = next(row for row in rows if row["login_username"] == "counter-user")
+                    self.assertEqual(row["issuer"], "Example HOTP")
+                    self.assertEqual(row["algorithm"], "SHA512")
+                    self.assertEqual(row["digits"], "8")
+                    self.assertEqual(row["counter"], "5")
+                    self.assertEqual(row["folder"], folder)
+                    self.assertTrue(row["login_totp"].startswith("otpauth://hotp/"))
+                    self.assertIn("counter=5", row["login_totp"])
 
     def test_cli_default_output_no_output_flag(self):
         with tempfile.TemporaryDirectory() as td:
