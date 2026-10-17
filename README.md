@@ -1,6 +1,6 @@
 # Bitwarden MFA Auth Migrator
 
-A Python tool to migrate TOTP/HOTP secrets from common authenticator apps into a Bitwarden/Vaultwarden-compatible CSV.
+A Python tool to migrate TOTP/HOTP secrets from common authenticator apps into Bitwarden/Vaultwarden, either directly or through a compatible CSV.
 
 ## Features
 
@@ -96,13 +96,23 @@ Tokens that only contain `encrypted_seed` (no plaintext secret) are skipped; if 
 
 > Prefer converting Authy output to `otpauth://` lines if your export tool supports that—the otpauth path is the most portable.
 
-The tool writes a Bitwarden-compatible CSV locally; it does not connect to a vault. By default the file is `bitwarden_import.csv`. `--output` and `--bw-folder` let you choose the CSV path and destination folder. Account labels are only printed if you omit `--quiet`.
+By default the tool writes a Bitwarden-compatible CSV locally. Use `--import-bw` to create login items directly through the Bitwarden CLI. The direct path reads the session from `BW_SESSION`; it never accepts the session key as a command-line argument. Account labels are only printed if you omit `--quiet`.
+
+Install and unlock the [Bitwarden CLI](https://bitwarden.com/help/cli/) first, then run:
+
+```bash
+export BW_SESSION="$(bw unlock --raw)"
+python ga_to_bitwarden.py aegis-export.json --import-bw --quiet
+unset BW_SESSION
+```
+
+The CLI must be on `PATH`, and its vault must be unlocked. `--bw-folder` chooses the destination folder; when omitted, the same source-specific folder used by CSV export is used. A folder is created if it does not already exist. Add `--dry-run` to parse the input and report the number of accounts without invoking `bw` or changing the vault. Add `--output path.csv` with `--import-bw` only if you also want a CSV copy written locally.
 
 ## Usage (CLI)
 
 ```bash
-python ga_to_bitwarden.py <input> [--format auto|qr|ga|otpauth|aegis|authy] [-o out.csv] [--bw-folder NAME] [-q]
-python ga_to_bitwarden.py --live [-o out.csv] [--bw-folder NAME] [-q]
+python ga_to_bitwarden.py <input> [--format auto|qr|ga|otpauth|aegis|authy] [--import-bw [--dry-run]] [-o out.csv] [--bw-folder NAME] [-q]
+python ga_to_bitwarden.py --live [--import-bw [--dry-run]] [-o out.csv] [--bw-folder NAME] [-q]
 ```
 
 | Option | Description |
@@ -110,8 +120,10 @@ python ga_to_bitwarden.py --live [-o out.csv] [--bw-folder NAME] [-q]
 | `input` | Image, plain `otpauth://` URI list, unencrypted Aegis JSON, decrypted Authy JSON, or a directory of supported files |
 | `--format`, `-f` | Force format (`auto` sniffs extension + content) |
 | `--live` | Webcam QR scanning (GA migration + otpauth QRs) |
-| `--output`, `-o` | Output CSV path (default: `bitwarden_import.csv`) |
+| `--output`, `-o` | CSV output path (default: `bitwarden_import.csv`; omitted by default with `--import-bw`) |
 | `--bw-folder` | Folder column for every row. Defaults to a source-specific folder. Pass `""` for a blank folder. |
+| `--import-bw` | Create items directly through `bw`; requires an unlocked CLI session in `BW_SESSION`. |
+| `--dry-run` | With `--import-bw`, report the number of parsed accounts without invoking `bw`. |
 | `--quiet`, `-q` | Do not print account names to the console |
 
 Example:
@@ -133,6 +145,12 @@ When no accounts are exported, the tool reports a **distinct** error instead of 
 The tool also refuses to write an empty CSV.
 
 ## Importing to Bitwarden / Vaultwarden
+
+### Direct CLI import
+
+Use `--import-bw` with an unlocked Bitwarden CLI session as shown above. Items are created as login entries with the OTP URI, username, notes, and folder. The tool reports success and failure counts; a partial failure returns exit code `2`. Failed account labels are omitted with `--quiet`. CLI output is not printed because it can contain vault data.
+
+### CSV import
 
 1. Log in to your Web Vault.
 2. Go to **Tools → Import Data**.
