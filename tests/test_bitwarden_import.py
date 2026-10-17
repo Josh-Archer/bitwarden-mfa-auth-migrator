@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import ga_to_bitwarden as m  # noqa: E402
+import ga_to_bitwarden as m
 
 FAKE_SECRET = "EXAMPLENOTREALAA"
 FAKE_SESSION = "fake-session-key-never-for-a-vault"
@@ -134,6 +134,15 @@ class TestDirectBitwardenImport(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True):
             result = m.import_accounts_to_bitwarden([sample_account()], dry_run=True)
         self.assertEqual(result, (0, []))
+        self.run_mock.assert_not_called()
+
+    def test_invalid_secret_is_rejected_before_any_cli_call(self):
+        account = sample_account()
+        account["secret"] = b""
+
+        with self.assertRaisesRegex(ValueError, "secret is empty"):
+            m.import_accounts_to_bitwarden([account])
+
         self.run_mock.assert_not_called()
 
     def test_unlocked_status_failure_has_no_item_creates(self):
