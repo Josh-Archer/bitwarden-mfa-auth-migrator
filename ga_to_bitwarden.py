@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: EXE001
 """Migrate TOTP secrets from common authenticator export formats to Bitwarden CSV."""
 
 import argparse
@@ -416,7 +417,7 @@ CSV_HEADERS = [
 ]
 
 
-def export_accounts_to_csv(results, output_file, folder=None):
+def export_accounts_to_csv(results, output_file, folder=None, quiet=False):
     """Write OTP account dicts to a Bitwarden-compatible CSV file.
 
     ``folder`` is the destination folder for every row (default:
@@ -429,7 +430,7 @@ def export_accounts_to_csv(results, output_file, folder=None):
             "No accounts to export; refusing to write an empty CSV"
         )
 
-    validate_account_secrets(results)
+    validate_account_secrets(results, quiet=quiet)
     with open(output_file, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
         writer.writeheader()
@@ -487,8 +488,9 @@ def classify_empty_export(*, has_images, unreadable_images, urls_seen, decode_fa
     )
 
 
-def normalize_secret_to_bytes(secret):
+def normalize_secret_to_bytes(secret, name=None, quiet=False):
     """Decode a base32 secret, accepting legacy hex with an explicit warning."""
+    account_label = "entry" if quiet else (name or "Unknown")
     if secret is None:
         raise ValueError("secret is missing")
     if isinstance(secret, (bytes, bytearray)):
@@ -500,10 +502,18 @@ def normalize_secret_to_bytes(secret):
         raise ValueError("secret is empty")
     # pad base32
     pad = (-len(s)) % 8
-    s += "=" * pad
+    s_padded = s + ("=" * pad)
     try:
-        decoded = base64.b32decode(s, casefold=True)
+        decoded = base64.b32decode(s_padded, casefold=True)
         if decoded:
+            raw_s = str(secret).strip().replace(" ", "").upper()
+            if len(raw_s) % 2 == 0 and re.fullmatch(r"[A-F2-7]+", raw_s):
+                print(
+                    f"[Warning] Secret for {account_label} is made only of A-F and 2-7 "
+                    "and could be hexadecimal; interpreting as base32. "
+                    "Verify this account's secret format.",
+                    file=sys.stderr,
+                )
             return decoded
     except (ValueError, TypeError):
         pass
@@ -511,7 +521,7 @@ def normalize_secret_to_bytes(secret):
     raw = str(secret).strip()
     if re.fullmatch(r"[0-9a-fA-F]+", raw) and len(raw) % 2 == 0:
         print(
-            "[Warning] Secret is not valid base32; interpreting a hex-looking "
+            f"[Warning] Secret for {account_label} is not valid base32; interpreting a hex-looking "
             "secret as hexadecimal. Verify this account's secret format.",
             file=sys.stderr,
         )
@@ -521,12 +531,12 @@ def normalize_secret_to_bytes(secret):
     raise ValueError("secret is not valid base32")
 
 
-def validate_account_secrets(accounts):
+def validate_account_secrets(accounts, quiet=False):
     """Reject malformed or empty secrets before any CSV file is opened."""
     for account in accounts:
-        name = account.get("name") or "Unknown"
+        name = "entry" if quiet else (account.get("name") or "Unknown")
         try:
-            normalize_secret_to_bytes(account.get("secret"))
+            normalize_secret_to_bytes(account.get("secret"), name=name, quiet=quiet)
         except ValueError as exc:
             raise ValueError(f"Invalid secret for {name}: {exc}") from exc
 
@@ -548,17 +558,19 @@ def make_account(
     counter=0,
     source="",
     notes="",
+    quiet=False,
 ):
+    account_label = "entry" if quiet else (name or "Unknown")
     try:
-        secret_bytes = normalize_secret_to_bytes(secret)
+        secret_bytes = normalize_secret_to_bytes(secret, name=account_label, quiet=quiet)
     except ValueError as exc:
-        raise ValueError(f"Invalid secret for {name or 'Unknown'}: {exc}") from exc
+        raise ValueError(f"Invalid secret for {account_label}: {exc}") from exc
     algo = (algorithm or "SHA1").upper().replace("SHA-1", "SHA1").replace("SHA-256", "SHA256").replace("SHA-512", "SHA512")
     try:
         digits = int(digits) if digits not in (None, "") else 6
     except (TypeError, ValueError):
         print(
-            f"[Warning] Invalid digits for {name or 'Unknown'}; using 6.",
+            f"[Warning] Invalid digits for {account_label}; using 6.",
             file=sys.stderr,
         )
         digits = 6
@@ -566,7 +578,7 @@ def make_account(
         period = int(period) if period not in (None, "") else 30
     except (TypeError, ValueError):
         print(
-            f"[Warning] Invalid period for {name or 'Unknown'}; using 30.",
+            f"[Warning] Invalid period for {account_label}; using 30.",
             file=sys.stderr,
         )
         period = 30
@@ -593,7 +605,7 @@ def make_account(
         "notes": notes or "",
     }
 
-def ga_params_to_account(params):
+def ga_params_to_account(params, quiet=False):
     algo = GA_ALGO_MAP.get(params.get("algorithm", 1), "SHA1")
     digits = GA_DIGITS_MAP.get(params.get("digits", 1), 6)
     otp_type = GA_TYPE_MAP.get(params.get("type", 2), "totp")
@@ -607,13 +619,14 @@ def ga_params_to_account(params):
         counter=params.get("counter", 0),
         source="google-authenticator",
         notes="Migrated from Google Authenticator",
+        quiet=quiet,
     )
 
 _OTPAUTH_RE = re.compile(r"otpauth://[^\s\"'<>]+", re.IGNORECASE)
 
 _MIGRATION_RE = re.compile(r"otpauth-migration://[^\s\"'<>]+", re.IGNORECASE)
 
-def parse_otpauth_uri(uri):
+def parse_otpauth_uri(uri, quiet=False):
     """Parse a single otpauth://totp|hotp URI into a normalized account."""
     uri = uri.strip()
     if not uri.lower().startswith("otpauth://"):
@@ -634,9 +647,8 @@ def parse_otpauth_uri(uri):
         name = name.strip()
 
     query = urllib.parse.parse_qs(parsed.query)
-    secret = (query.get("secret") or [""])[0]
-    if not secret:
-        return None
+    secret_list = query.get("secret")
+    secret = secret_list[0] if secret_list else ""
 
     issuer = (query.get("issuer") or [issuer_from_label])[0] or issuer_from_label
     algorithm = (query.get("algorithm") or ["SHA1"])[0]
@@ -655,6 +667,7 @@ def parse_otpauth_uri(uri):
         counter=counter,
         source="otpauth-uri",
         notes="Migrated from otpauth URI",
+        quiet=quiet,
     )
 
 def extract_uris_from_text(text):
@@ -666,7 +679,7 @@ def extract_uris_from_text(text):
     migrations = [u.rstrip(").,;]") for u in migrations]
     return migrations, otpauths
 
-def parse_otpauth_text(text):
+def parse_otpauth_text(text, quiet=False):
     """Parse all otpauth:// and otpauth-migration:// URIs from text."""
     accounts = []
     migrations, otpauths = extract_uris_from_text(text)
@@ -675,16 +688,16 @@ def parse_otpauth_text(text):
         payload = decode_migration_url(url)
         if payload:
             for params in parse_migration_payload(payload):
-                accounts.append(ga_params_to_account(params))
+                accounts.append(ga_params_to_account(params, quiet=quiet))
 
     for uri in otpauths:
-        acct = parse_otpauth_uri(uri)
+        acct = parse_otpauth_uri(uri, quiet=quiet)
         if acct:
             accounts.append(acct)
 
     return accounts
 
-def parse_aegis_export(data):
+def parse_aegis_export(data, quiet=False):
     """
     Parse an unencrypted Aegis Authenticator JSON export.
 
@@ -721,9 +734,13 @@ def parse_aegis_export(data):
         if not isinstance(entry, dict):
             continue
         info = entry.get("info") or {}
-        secret = info.get("secret") or entry.get("secret")
-        if not secret:
-            continue
+        secret = (
+            info.get("secret")
+            if "secret" in info
+            else entry.get("secret", "")
+        )
+        if secret is None:
+            secret = ""
         otp_type = (entry.get("type") or "totp").lower()
         accounts.append(
             make_account(
@@ -737,6 +754,7 @@ def parse_aegis_export(data):
                 counter=info.get("counter", 0),
                 source="aegis",
                 notes=(entry.get("note") or "") or "Migrated from Aegis",
+                quiet=quiet,
             )
         )
     return accounts
@@ -757,7 +775,7 @@ def is_aegis_export(data):
             return True
     return False
 
-def parse_authy_export(data):
+def parse_authy_export(data, quiet=False):
     """
     Parse common community Authy export JSON shapes.
 
@@ -795,16 +813,24 @@ def parse_authy_export(data):
     for tok in tokens:
         if not isinstance(tok, dict):
             continue
+        has_secret_key = any(k in tok for k in ("decrypted_seed", "secret", "seed", "token"))
+        if not has_secret_key and (tok.get("encrypted_seed") or tok.get("key")):
+            skipped_encrypted += 1
+            continue
+
         secret = (
             tok.get("decrypted_seed")
-            or tok.get("secret")
-            or tok.get("seed")
-            or tok.get("token")
+            if "decrypted_seed" in tok
+            else tok.get("secret")
+            if "secret" in tok
+            else tok.get("seed")
+            if "seed" in tok
+            else tok.get("token")
+            if "token" in tok
+            else ""
         )
-        if not secret:
-            if tok.get("encrypted_seed") or tok.get("key"):
-                skipped_encrypted += 1
-            continue
+        if secret is None:
+            secret = ""
 
         name = tok.get("name") or tok.get("account_type") or tok.get("label") or "Unknown"
         issuer = tok.get("issuer") or tok.get("account_type") or ""
@@ -829,6 +855,7 @@ def parse_authy_export(data):
                 counter=tok.get("counter", 0),
                 source="authy",
                 notes="Migrated from Authy export",
+                quiet=quiet,
             )
         )
 
@@ -885,14 +912,14 @@ def build_totp_uri(account):
     query = urllib.parse.urlencode(params)
     return f"otpauth://{otp_type}/{label_enc}?{query}"
 
-def export_bitwarden_csv(accounts, output_file, folder=None):
+def export_bitwarden_csv(accounts, output_file, folder=None, quiet=False):
     """Write normalized accounts to a Bitwarden CSV.
 
     ``folder`` overrides the per-source default for every row. ``None`` keeps
     that default (see ``_SOURCE_FOLDER_NAMES``). ``""`` writes a blank folder.
     Issuer, algorithm, digits, period, and counter are always written as columns.
     """
-    validate_account_secrets(accounts)
+    validate_account_secrets(accounts, quiet=quiet)
     with open(output_file, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
         writer.writeheader()
@@ -937,9 +964,9 @@ def export_bitwarden_csv(accounts, output_file, folder=None):
                 **normalized_otp_metadata(otp),
             })
 
-def write_bitwarden_csv(results, output_file, folder=None):
+def write_bitwarden_csv(results, output_file, folder=None, quiet=False):
     """Write OTP params to a Bitwarden-compatible CSV with full otpauth URIs."""
-    validate_account_secrets(results)
+    validate_account_secrets(results, quiet=quiet)
     with open(output_file, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
         writer.writeheader()
@@ -1048,7 +1075,7 @@ def get_qr_payloads(image):
     return payloads
 
 
-def accounts_from_qr_payloads(payloads):
+def accounts_from_qr_payloads(payloads, quiet=False):
     accounts = []
     for payload in payloads:
         payload = (payload or "").strip()
@@ -1058,14 +1085,14 @@ def accounts_from_qr_payloads(payloads):
             data = decode_migration_url(payload)
             if data:
                 for params in parse_migration_payload(data):
-                    accounts.append(ga_params_to_account(params))
+                    accounts.append(ga_params_to_account(params, quiet=quiet))
         elif payload.lower().startswith("otpauth://"):
-            acct = parse_otpauth_uri(payload)
+            acct = parse_otpauth_uri(payload, quiet=quiet)
             if acct:
                 accounts.append(acct)
         else:
             # free text that might embed URIs
-            accounts.extend(parse_otpauth_text(payload))
+            accounts.extend(parse_otpauth_text(payload, quiet=quiet))
     return accounts
 
 
@@ -1138,23 +1165,23 @@ def load_accounts_from_file(path, fmt="auto", quiet=False):
                 text = "\n".join(data)
         except json.JSONDecodeError:
             pass
-        return parse_otpauth_text(text)
+        return parse_otpauth_text(text, quiet=quiet)
     if fmt == "aegis":
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return parse_aegis_export(data)
+        return parse_aegis_export(data, quiet=quiet)
     if fmt == "authy":
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return parse_authy_export(data)
+        return parse_authy_export(data, quiet=quiet)
     if fmt == "json-unknown":
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         # try each parser
         if is_aegis_export(data):
-            return parse_aegis_export(data)
+            return parse_aegis_export(data, quiet=quiet)
         if is_authy_export(data):
-            return parse_authy_export(data)
+            return parse_authy_export(data, quiet=quiet)
         raise ValueError(f"Unrecognized JSON export format: {path}")
     if fmt == "ga" or fmt == "google":
         # force GA migration QR path
@@ -1190,7 +1217,7 @@ def load_accounts_from_image(path, quiet=False):
             if payload in seen_payloads:
                 continue
             seen_payloads.add(payload)
-            accts = accounts_from_qr_payloads([payload])
+            accts = accounts_from_qr_payloads([payload], quiet=quiet)
             if accts:
                 if not quiet:
                     for otp in accts:
@@ -1235,7 +1262,7 @@ def live_scan(quiet=False):
                 if info not in seen_payloads:
                     seen_payloads.add(info)
                     try:
-                        otp_list = accounts_from_qr_payloads([info])
+                        otp_list = accounts_from_qr_payloads([info], quiet=quiet)
                         if not otp_list:
                             print("  [Error] Empty/invalid QR payload; skipping")
                             continue
@@ -1359,24 +1386,34 @@ def main(argv=None):
             else:
                 print(f"  [Success] {len(accts)} account(s) from this file.")
                 results.extend(accts)
+        if results:
+            out = args.output or "bitwarden_import.csv"
+            try:
+                export_bitwarden_csv(results, out, folder=args.bw_folder, quiet=args.quiet)
+                print(f"\nSuccessfully exported {len(results)} accounts to {out}")
+            except Exception as e:  # noqa: BLE001 - CSV serialization may raise multiple errors
+                print(f"Error writing CSV file: {e}", file=sys.stderr)
+                return 1
+
         if file_errors:
-            print(
-                f"\nImport failed: {len(file_errors)} file(s) had errors; "
-                "no CSV was written.",
-                file=sys.stderr,
-            )
+            if not results:
+                print(
+                    f"\nImport failed: {len(file_errors)} file(s) had errors; "
+                    "no CSV was written.",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"\nImport finished with errors: {len(file_errors)} file(s) had errors.",
+                    file=sys.stderr,
+                )
             return 1
+
         if not results:
             print("\nNo accounts extracted.", file=sys.stderr)
             return 1
-        out = args.output or "bitwarden_import.csv"
-        try:
-            export_bitwarden_csv(results, out, folder=args.bw_folder)
-            print(f"\nSuccessfully exported {len(results)} accounts to {out}")
-            return 0
-        except Exception as e:  # noqa: BLE001 - CSV serialization may raise multiple errors
-            print(f"Error writing CSV file: {e}", file=sys.stderr)
-            return 1
+
+        return 0
 
     results = []
     unreadable_images = 0
@@ -1509,7 +1546,7 @@ def main(argv=None):
     output_file = args.output or "bitwarden_import.csv"
     
     try:
-        count = export_accounts_to_csv(results, output_file, folder=args.bw_folder)
+        count = export_accounts_to_csv(results, output_file, folder=args.bw_folder, quiet=args.quiet)
         print(f"\nSuccessfully exported {count} accounts to {output_file}")
         print("Next steps:")
         print("1. Open Vaultwarden Web Vault")

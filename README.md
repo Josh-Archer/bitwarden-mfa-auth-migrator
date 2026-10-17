@@ -96,7 +96,7 @@ Tokens that only contain `encrypted_seed` (no plaintext secret) are skipped; if 
 
 > Prefer converting Authy output to `otpauth://` lines if your export tool supports that—the otpauth path is the most portable.
 
-The tool writes a Bitwarden-compatible CSV locally; it does not connect to a vault. By default the file is `bitwarden_import.csv`. `--output` and `--bw-folder` let you choose the CSV path and destination folder. Account labels are only printed if you omit `--quiet`.
+The tool writes a Bitwarden-compatible CSV locally; it does not connect to a vault. By default the file is `bitwarden_import.csv`. `--output` and `--bw-folder` let you choose the CSV path and destination folder. Account labels are only printed if you omit `--quiet`; under `--quiet`, errors and warnings refer to a generic `entry` label instead.
 
 ## Usage (CLI)
 
@@ -107,12 +107,12 @@ python ga_to_bitwarden.py --live [-o out.csv] [--bw-folder NAME] [-q]
 
 | Option | Description |
 |--------|-------------|
-| `input` | Image, plain `otpauth://` URI list, unencrypted Aegis JSON, decrypted Authy JSON, or a directory of supported files |
+| `input` | Image, plain `otpauth://` URI list, unencrypted Aegis JSON, decrypted Authy JSON, or a directory of supported files (in directory mode, valid files are exported even if one file reports errors, with a non-zero exit) |
 | `--format`, `-f` | Force format (`auto` sniffs extension + content) |
 | `--live` | Webcam QR scanning (GA migration + otpauth QRs) |
 | `--output`, `-o` | Output CSV path (default: `bitwarden_import.csv`) |
 | `--bw-folder` | Folder column for every row. Defaults to a source-specific folder. Pass `""` for a blank folder. |
-| `--quiet`, `-q` | Do not print account names to the console |
+| `--quiet`, `-q` | Do not print account names to the console (suppresses account names in errors/warnings) |
 | `--require-zbar` | Fail unless `pyzbar` is installed; useful when dense QR exports need ZBar |
 
 Example:
@@ -123,13 +123,17 @@ python ga_to_bitwarden.py C:\exports\ --output my_codes.csv --quiet
 
 ### Exit codes / errors
 
-When no accounts are exported, the tool reports a **distinct** error instead of a silent empty file:
+When no accounts are exported, or when invalid/empty secrets or corrupted files are encountered, the tool reports a **distinct** error instead of a silent empty file:
 
 | Situation | Error type | Typical exit code |
 |-----------|------------|-------------------|
 | pyzbar missing and no QR decoded | `MissingDependencyError` | 2 |
 | Images/QR unreadable | `UnreadableQRError` | 1 |
 | QR found but payload empty/invalid | `EmptyPayloadError` | 3 |
+| Invalid or empty secret in import | `ValueError` | 1 |
+| File read/parse failure in import | `ValueError` / `OSError` | 1 |
+
+Invalid or empty secrets report the affected account name (or generic `entry` under `--quiet`) and fail the import before any CSV is written. Hex-looking secrets made only of `A–F` and `2–7` decode as base32 with a warning asking to verify the account format; legacy hex strings failing base32 decode as hexadecimal with an explicit warning naming the account. In directory mode, errors from a bad file are reported without aborting the export of other valid files, while still returning a non-zero exit code.
 
 The tool also refuses to write an empty CSV.
 
