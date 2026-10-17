@@ -96,7 +96,7 @@ Tokens that only contain `encrypted_seed` (no plaintext secret) are skipped; if 
 
 > Prefer converting Authy output to `otpauth://` lines if your export tool supports that—the otpauth path is the most portable.
 
-By default the tool writes a Bitwarden-compatible CSV locally (`bitwarden_import.csv`). Use `--import-bw` to create login items directly through the Bitwarden CLI. The direct path reads the session from `BW_SESSION`; it never accepts the session key as a command-line argument. `--output` and `--bw-folder` choose the CSV path and destination folder. Account labels are only printed if you omit `--quiet`; under `--quiet`, errors and warnings refer to a generic `entry` label instead.
+By default the tool writes a Bitwarden-compatible CSV locally (`bitwarden_import.csv`). Use `--import-bw` to create login items directly through the Bitwarden CLI. The direct path reads the session from `BW_SESSION`; it never accepts the session key as a command-line argument. `--output` and `--bw-folder` choose the CSV path and destination folder. Account labels are only printed if you omit `--quiet`; under `--quiet`, errors and warnings refer to a generic `entry` label instead, and file names are masked (e.g. `file #1`).
 
 Install and unlock the [Bitwarden CLI](https://bitwarden.com/help/cli/) first, then run:
 
@@ -117,14 +117,14 @@ python ga_to_bitwarden.py --live [--import-bw [--dry-run]] [-o out.csv] [--bw-fo
 
 | Option | Description |
 |--------|-------------|
-| `input` | Image, plain `otpauth://` URI list, unencrypted Aegis JSON, decrypted Authy JSON, or a directory of supported files (in directory mode, valid files are still exported, or imported with `--import-bw`, even if one file reports errors, and the command exits non-zero) |
+| `input` | Image, plain `otpauth://` URI list, unencrypted Aegis JSON, decrypted Authy JSON, or a directory of supported files (in directory mode, valid files are still exported, or imported with `--import-bw`, even if one file reports errors, with a non-zero exit; if any `.json` is truncated or corrupt, no CSV is written and `-o` is left untouched) |
 | `--format`, `-f` | Force format (`auto` sniffs extension + content) |
 | `--live` | Webcam QR scanning (GA migration + otpauth QRs) |
 | `--output`, `-o` | CSV output path (default: `bitwarden_import.csv`; omitted by default with `--import-bw`) |
 | `--bw-folder` | Folder column for every row. Defaults to a source-specific folder. Pass `""` for a blank folder. |
 | `--import-bw` | Create items directly through `bw`; requires an unlocked CLI session in `BW_SESSION`. |
 | `--dry-run` | With `--import-bw`, report the number of parsed accounts without invoking `bw`. |
-| `--quiet`, `-q` | Do not print account names to the console (suppresses account names in errors/warnings) |
+| `--quiet`, `-q` | Do not print account names or file names to the console (suppresses account names in errors/warnings and masks file names) |
 | `--require-zbar` | Fail unless `pyzbar` is installed; useful when dense QR exports need ZBar |
 
 Example:
@@ -145,7 +145,7 @@ When no accounts are exported, or when invalid/empty secrets or corrupted files 
 | Invalid or empty secret in import | `ValueError` | 1 |
 | File read/parse failure in import | `ValueError` / `OSError` | 1 |
 
-Invalid or empty secrets report the affected account name (or generic `entry` under `--quiet`) and fail the import before any CSV is written or any Bitwarden CLI call is made. Hex-looking secrets made only of `A–F` and `2–7` decode as base32 with a warning asking to verify the account format; legacy hex strings failing base32 decode as hexadecimal with an explicit warning naming the account. In directory mode, errors from a bad file are reported without aborting export or direct import of the other valid files, while still returning a non-zero exit code.
+Invalid or empty secrets report the affected account name (or generic `entry` under `--quiet`) and fail the import before any CSV is written or any Bitwarden CLI call is made. Hex-looking secrets made only of `A–F` and `2–7` decode as base32 with a warning asking to verify the account format; legacy hex strings failing base32 decode as hexadecimal with an explicit warning naming the account. In directory mode, errors from a bad file are reported without aborting the export or direct import of other valid files (with partial export overwriting an existing `-o` file), while still returning a non-zero exit code. However, if any `.json` inside the directory is truncated or corrupt, the run exits non-zero and does not write or overwrite the `-o` output. All error lines, warnings, and summary error messages are emitted to stderr.
 
 The tool also refuses to write an empty CSV.
 

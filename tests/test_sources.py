@@ -201,7 +201,7 @@ class TestAegis(unittest.TestCase):
             with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                 rc = m.main([str(path), "-o", str(output), "-q"])
             self.assertNotEqual(rc, 0)
-            self.assertIn("appears encrypted", stdout.getvalue())
+            self.assertIn("appears encrypted", stderr.getvalue())
             self.assertFalse(output.exists())
 
 
@@ -378,7 +378,7 @@ class TestCliEndToEnd(unittest.TestCase):
             with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                 rc = m.main([str(source), "-o", str(output)])
             self.assertNotEqual(rc, 0)
-            self.assertIn("Invalid secret for BadAccount", stdout.getvalue())
+            self.assertIn("Invalid secret for BadAccount", stderr.getvalue())
             self.assertNotIn("Successfully exported", stdout.getvalue())
             self.assertFalse(output.exists())
 
@@ -388,7 +388,7 @@ class TestCliEndToEnd(unittest.TestCase):
             with contextlib.redirect_stdout(stdout_q), contextlib.redirect_stderr(stderr_q):
                 rc_q = m.main([str(source), "-o", str(output), "-q"])
             self.assertNotEqual(rc_q, 0)
-            self.assertIn("Invalid secret for entry", stdout_q.getvalue())
+            self.assertIn("Invalid secret for entry", stderr_q.getvalue())
             self.assertNotIn("BadAccount", stdout_q.getvalue())
             self.assertNotIn("BadAccount", stderr_q.getvalue())
             self.assertFalse(output.exists())
@@ -407,7 +407,7 @@ class TestCliEndToEnd(unittest.TestCase):
             with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                 rc = m.main([str(source), "-o", str(output)])
             self.assertNotEqual(rc, 0)
-            self.assertIn("Invalid secret for EmptyOtpauthAcct", stdout.getvalue())
+            self.assertIn("Invalid secret for EmptyOtpauthAcct", stderr.getvalue())
             self.assertFalse(output.exists())
 
             # Verify quiet mode suppresses account name
@@ -416,7 +416,7 @@ class TestCliEndToEnd(unittest.TestCase):
             with contextlib.redirect_stdout(stdout_q), contextlib.redirect_stderr(stderr_q):
                 rc_q = m.main([str(source), "-o", str(output), "-q"])
             self.assertNotEqual(rc_q, 0)
-            self.assertIn("Invalid secret for entry", stdout_q.getvalue())
+            self.assertIn("Invalid secret for entry", stderr_q.getvalue())
             self.assertNotIn("EmptyOtpauthAcct", stdout_q.getvalue())
             self.assertNotIn("EmptyOtpauthAcct", stderr_q.getvalue())
             self.assertFalse(output.exists())
@@ -452,7 +452,7 @@ class TestCliEndToEnd(unittest.TestCase):
             with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                 rc = m.main([str(source), "-o", str(output), "-f", "aegis"])
             self.assertNotEqual(rc, 0)
-            self.assertIn("Invalid secret for EmptyAegisAcct", stdout.getvalue())
+            self.assertIn("Invalid secret for EmptyAegisAcct", stderr.getvalue())
             self.assertFalse(output.exists())
 
             # Verify quiet mode suppresses account name
@@ -461,7 +461,7 @@ class TestCliEndToEnd(unittest.TestCase):
             with contextlib.redirect_stdout(stdout_q), contextlib.redirect_stderr(stderr_q):
                 rc_q = m.main([str(source), "-o", str(output), "-f", "aegis", "-q"])
             self.assertNotEqual(rc_q, 0)
-            self.assertIn("Invalid secret for entry", stdout_q.getvalue())
+            self.assertIn("Invalid secret for entry", stderr_q.getvalue())
             self.assertNotIn("EmptyAegisAcct", stdout_q.getvalue())
             self.assertNotIn("EmptyAegisAcct", stderr_q.getvalue())
             self.assertFalse(output.exists())
@@ -492,7 +492,7 @@ class TestCliEndToEnd(unittest.TestCase):
             with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                 rc = m.main([str(source), "-o", str(output), "-f", "authy"])
             self.assertNotEqual(rc, 0)
-            self.assertIn("Invalid secret for EmptyAuthyAcct", stdout.getvalue())
+            self.assertIn("Invalid secret for EmptyAuthyAcct", stderr.getvalue())
             self.assertFalse(output.exists())
 
             # Verify quiet mode suppresses account name
@@ -501,7 +501,7 @@ class TestCliEndToEnd(unittest.TestCase):
             with contextlib.redirect_stdout(stdout_q), contextlib.redirect_stderr(stderr_q):
                 rc_q = m.main([str(source), "-o", str(output), "-f", "authy", "-q"])
             self.assertNotEqual(rc_q, 0)
-            self.assertIn("Invalid secret for entry", stdout_q.getvalue())
+            self.assertIn("Invalid secret for entry", stderr_q.getvalue())
             self.assertNotIn("EmptyAuthyAcct", stdout_q.getvalue())
             self.assertNotIn("EmptyAuthyAcct", stderr_q.getvalue())
             self.assertFalse(output.exists())
@@ -526,13 +526,122 @@ class TestCliEndToEnd(unittest.TestCase):
             with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                 rc = m.main([str(directory), "-o", str(output)])
             self.assertNotEqual(rc, 0)
-            self.assertIn("appears encrypted", stdout.getvalue())
+            self.assertIn("appears encrypted", stderr.getvalue())
             self.assertIn("1 file(s) had errors", stderr.getvalue())
+            self.assertIn("bad_encrypted.json", stderr.getvalue())
+            self.assertIn("out.csv is PARTIAL: excludes bad_encrypted.json", stderr.getvalue())
             self.assertTrue(output.exists())
             with output.open(newline="", encoding="utf-8") as f:
                 rows = list(csv.DictReader(f))
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["login_username"], "user@example.com")
+
+    def test_directory_with_corrupt_json_fails_and_leaves_output_untouched(self):
+        with tempfile.TemporaryDirectory() as td:
+            directory = Path(td) / "imports"
+            directory.mkdir()
+            good_file = directory / "good.txt"
+            good_file.write_text(
+                f"otpauth://totp/ValidAcct:user@example.com?secret={DEMO_SECRET_B32}&issuer=ValidAcct",
+                encoding="utf-8",
+            )
+            corrupt_file = directory / "corrupt.json"
+            corrupt_file.write_text('{"version": 1, "db": {', encoding="utf-8")
+            output = Path(td) / "out.csv"
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                rc = m.main([str(directory), "-o", str(output)])
+            self.assertNotEqual(rc, 0)
+            self.assertFalse(output.exists())
+            self.assertIn("1 file(s) had errors", stderr.getvalue())
+            self.assertIn("corrupt.json", stderr.getvalue())
+            self.assertIn("no CSV was written", stderr.getvalue())
+            self.assertNotIn("Successfully exported", stdout.getvalue())
+            self.assertNotIn("Successfully exported", stderr.getvalue())
+
+    def test_directory_with_corrupt_json_does_not_overwrite_preexisting_output(self):
+        with tempfile.TemporaryDirectory() as td:
+            directory = Path(td) / "imports"
+            directory.mkdir()
+            good_file = directory / "good.txt"
+            good_file.write_text(
+                f"otpauth://totp/ValidAcct:user@example.com?secret={DEMO_SECRET_B32}&issuer=ValidAcct",
+                encoding="utf-8",
+            )
+            corrupt_file = directory / "corrupt.json"
+            corrupt_file.write_text('{"header": truncated...', encoding="utf-8")
+            output = Path(td) / "out.csv"
+            output.write_text("PREEXISTING_CONTENT_DO_NOT_OVERWRITE", encoding="utf-8")
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                rc = m.main([str(directory), "-o", str(output)])
+            self.assertNotEqual(rc, 0)
+            self.assertEqual(output.read_text(encoding="utf-8"), "PREEXISTING_CONTENT_DO_NOT_OVERWRITE")
+            self.assertIn("1 file(s) had errors", stderr.getvalue())
+            self.assertIn("corrupt.json", stderr.getvalue())
+            self.assertIn("no CSV was written", stderr.getvalue())
+
+    def test_directory_with_corrupt_json_quiet_suppresses_filenames(self):
+        with tempfile.TemporaryDirectory() as td:
+            directory = Path(td) / "imports"
+            directory.mkdir()
+            good_file = directory / "alice-secret-name.txt"
+            good_file.write_text(
+                f"otpauth://totp/ValidAcct:user@example.com?secret={DEMO_SECRET_B32}&issuer=ValidAcct",
+                encoding="utf-8",
+            )
+            corrupt_file = directory / "bob-secret-name.json"
+            corrupt_file.write_text('{"db": ', encoding="utf-8")
+            output = Path(td) / "out.csv"
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                rc = m.main([str(directory), "-o", str(output), "-q"])
+            self.assertNotEqual(rc, 0)
+            self.assertFalse(output.exists())
+            combined = stdout.getvalue() + stderr.getvalue()
+            self.assertNotIn("alice-secret-name", combined)
+            self.assertNotIn("bob-secret-name", combined)
+            self.assertIn("file #", combined)
+            self.assertIn("no CSV was written", stderr.getvalue())
+
+    def test_directory_with_foreign_json_skips_with_warning_and_exports_good_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            directory = Path(td) / "imports"
+            directory.mkdir()
+            good_file = directory / "good.txt"
+            good_file.write_text(
+                f"otpauth://totp/ValidAcct:user@example.com?secret={DEMO_SECRET_B32}&issuer=ValidAcct",
+                encoding="utf-8",
+            )
+            foreign_file = directory / "foreign.json"
+            foreign_file.write_text(json.dumps({"unrelated_app_setting": 123}), encoding="utf-8")
+            output = Path(td) / "out.csv"
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                rc = m.main([str(directory), "-o", str(output)])
+            self.assertEqual(rc, 0)
+            self.assertTrue(output.exists())
+            self.assertIn("Skipping an unsupported file format", stderr.getvalue())
+            self.assertIn("Successfully exported 1 accounts", stdout.getvalue())
+
+    def test_single_corrupt_json_file_fails_and_leaves_output_untouched(self):
+        with tempfile.TemporaryDirectory() as td:
+            corrupt_file = Path(td) / "corrupt.json"
+            corrupt_file.write_text('{"bad": ', encoding="utf-8")
+            output = Path(td) / "out.csv"
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                rc = m.main([str(corrupt_file), "-o", str(output)])
+            self.assertNotEqual(rc, 0)
+            self.assertFalse(output.exists())
+            self.assertIn("1 file(s) had errors", stderr.getvalue())
+            self.assertIn("corrupt.json", stderr.getvalue())
+            self.assertIn("no CSV was written", stderr.getvalue())
 
     def test_cli_exports_hotp_metadata_for_each_source(self):
         fixtures = [
