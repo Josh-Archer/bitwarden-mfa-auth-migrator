@@ -1269,6 +1269,14 @@ def main(argv=None):
         return 2
 
     # Multi-source file loaders for non-QR formats (and auto when not an image).
+    auto_file_format = None
+    if (
+        not args.live
+        and args.format == "auto"
+        and args.input
+        and os.path.isfile(args.input)
+    ):
+        auto_file_format = detect_format(args.input)
     if (
         not args.live
         and args.input
@@ -1276,8 +1284,10 @@ def main(argv=None):
             args.format in ("otpauth", "aegis", "authy")
             or (
                 args.format == "auto"
-                and os.path.isfile(args.input)
-                and Path(args.input).suffix.lower() in (TEXT_EXTENSIONS | JSON_EXTENSIONS)
+                and (
+                    Path(args.input).suffix.lower() in (TEXT_EXTENSIONS | JSON_EXTENSIONS)
+                    or auto_file_format in ("otpauth", "aegis", "authy")
+                )
             )
         )
     ):

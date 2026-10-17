@@ -223,6 +223,22 @@ class TestCliEndToEnd(unittest.TestCase):
                 rows = list(csv.DictReader(f))
             self.assertEqual(len(rows), 3)
 
+    def test_cli_auto_detects_extensionless_otpauth_text(self):
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td) / "accounts"
+            source.write_text(
+                f"otpauth://hotp/Example:counter-user?secret={DEMO_SECRET_B32_3}&counter=5",
+                encoding="utf-8",
+            )
+            out = Path(td) / "bw.csv"
+            rc = m.main([str(source), "-o", str(out), "-q"])
+            self.assertEqual(rc, 0)
+            with out.open(newline="", encoding="utf-8") as f:
+                row = next(csv.DictReader(f))
+            self.assertEqual(row["login_username"], "counter-user")
+            self.assertTrue(row["login_totp"].startswith("otpauth://hotp/"))
+            self.assertIn("counter=5", row["login_totp"])
+
     def test_cli_exports_hotp_metadata_for_each_source(self):
         fixtures = [
             ("aegis_export.json", "Aegis Migration"),
