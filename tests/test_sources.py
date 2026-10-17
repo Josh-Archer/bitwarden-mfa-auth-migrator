@@ -65,7 +65,13 @@ class TestOtpauthUri(unittest.TestCase):
         self.assertEqual(acct["counter"], 3)
 
     def test_missing_secret(self):
-        self.assertIsNone(m.parse_otpauth_uri("otpauth://totp/NoSecret?issuer=X"))
+        with self.assertRaisesRegex(ValueError, "Invalid secret for NoSecret"):
+            m.parse_otpauth_uri("otpauth://totp/NoSecret?issuer=X")
+
+    def test_empty_secret_rejected_with_account_name(self):
+        uri = "otpauth://totp/EmptyAcct?secret="
+        with self.assertRaisesRegex(ValueError, "Invalid secret for EmptyAcct"):
+            m.parse_otpauth_uri(uri)
 
     def test_invalid_secret_rejected_with_account_name(self):
         uri = "otpauth://totp/BadAccount?secret=NOT-BASE32-!!"
@@ -78,7 +84,35 @@ class TestOtpauthUri(unittest.TestCase):
             account = m.make_account("0123456789abcdef", name="Hex account")
         self.assertEqual(account["secret"], bytes.fromhex("0123456789abcdef"))
         self.assertIn("interpreting a hex-looking secret as hexadecimal", stderr.getvalue())
+        self.assertIn("Secret for Hex account is not valid base32", stderr.getvalue())
         self.assertNotIn("0123456789abcdef", stderr.getvalue())
+
+        stderr_q = io.StringIO()
+        with contextlib.redirect_stderr(stderr_q):
+            account_q = m.make_account("0123456789abcdef", name="Hex account", quiet=True)
+        self.assertEqual(account_q["secret"], bytes.fromhex("0123456789abcdef"))
+        self.assertIn("Secret for entry is not valid base32", stderr_q.getvalue())
+        self.assertNotIn("Hex account", stderr_q.getvalue())
+
+    def test_warns_on_hex_looking_secret_made_only_of_af_and_27(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            account = m.make_account("A2B3C4D5", name="Ambiguous account")
+        self.assertEqual(account["name"], "Ambiguous account")
+        self.assertIn(
+            "Secret for Ambiguous account is made only of A-F and 2-7 and could be hexadecimal",
+            stderr.getvalue(),
+        )
+        self.assertNotIn("A2B3C4D5", stderr.getvalue())
+
+        stderr_q = io.StringIO()
+        with contextlib.redirect_stderr(stderr_q):
+            m.make_account("A2B3C4D5", name="Ambiguous account", quiet=True)
+        self.assertIn(
+            "Secret for entry is made only of A-F and 2-7 and could be hexadecimal",
+            stderr_q.getvalue(),
+        )
+        self.assertNotIn("Ambiguous account", stderr_q.getvalue())
 
     def test_invalid_digits_and_period_warn_when_using_defaults(self):
         stderr = io.StringIO()
@@ -150,6 +184,11 @@ class TestAegis(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Invalid secret for Bad Aegis"):
             m.parse_aegis_export(data)
 
+    def test_empty_secret_rejected_with_entry_name(self):
+        data = {"db": {"entries": [{"name": "Empty Aegis", "info": {"secret": ""}}]}}
+        with self.assertRaisesRegex(ValueError, "Invalid secret for Empty Aegis"):
+            m.parse_aegis_export(data)
+
     def test_encrypted_auto_detection_and_cli_error(self):
         data = {"header": {"slots": [{"type": "raw"}]}, "db": "ciphertext"}
         with tempfile.TemporaryDirectory() as tmp:
@@ -194,6 +233,11 @@ class TestAuthy(unittest.TestCase):
     def test_invalid_secret_rejected_with_token_name(self):
         data = [{"name": "Bad Authy", "secret": "BAD!!"}]
         with self.assertRaisesRegex(ValueError, "Invalid secret for Bad Authy"):
+            m.parse_authy_export(data)
+
+    def test_empty_secret_rejected_with_token_name(self):
+        data = [{"name": "Empty Authy", "decrypted_seed": ""}]
+        with self.assertRaisesRegex(ValueError, "Invalid secret for Empty Authy"):
             m.parse_authy_export(data)
 
     def test_encrypted_only_raises(self):
@@ -332,11 +376,163 @@ class TestCliEndToEnd(unittest.TestCase):
             stdout = io.StringIO()
             stderr = io.StringIO()
             with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-                rc = m.main([str(source), "-o", str(output), "-q"])
+                rc = m.main([str(source), "-o", str(output)])
             self.assertNotEqual(rc, 0)
             self.assertIn("Invalid secret for BadAccount", stdout.getvalue())
             self.assertNotIn("Successfully exported", stdout.getvalue())
             self.assertFalse(output.exists())
+
+            # With -q, account name must NOT be printed
+            stdout_q = io.StringIO()
+            stderr_q = io.StringIO()
+            with contextlib.redirect_stdout(stdout_q), contextlib.redirect_stderr(stderr_q):
+                rc_q = m.main([str(source), "-o", str(output), "-q"])
+            self.assertNotEqual(rc_q, 0)
+            self.assertIn("Invalid secret for entry", stdout_q.getvalue())
+            self.assertNotIn("BadAccount", stdout_q.getvalue())
+            self.assertNotIn("BadAccount", stderr_q.getvalue())
+            self.assertFalse(output.exists())
+
+    def test_cli_empty_secret_otpauth_fails_even_next_to_valid_entry(self):
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td) / "otpauth.txt"
+            source.write_text(
+                f"otpauth://totp/GoodAccount?secret={DEMO_SECRET_B32}&issuer=Good\n"
+                "otpauth://totp/EmptyOtpauthAcct?secret=&issuer=Bad\n",
+                encoding="utf-8",
+            )
+            output = Path(td) / "out.csv"
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                rc = m.main([str(source), "-o", str(output)])
+            self.assertNotEqual(rc, 0)
+            self.assertIn("Invalid secret for EmptyOtpauthAcct", stdout.getvalue())
+            self.assertFalse(output.exists())
+
+            # Verify quiet mode suppresses account name
+            stdout_q = io.StringIO()
+            stderr_q = io.StringIO()
+            with contextlib.redirect_stdout(stdout_q), contextlib.redirect_stderr(stderr_q):
+                rc_q = m.main([str(source), "-o", str(output), "-q"])
+            self.assertNotEqual(rc_q, 0)
+            self.assertIn("Invalid secret for entry", stdout_q.getvalue())
+            self.assertNotIn("EmptyOtpauthAcct", stdout_q.getvalue())
+            self.assertNotIn("EmptyOtpauthAcct", stderr_q.getvalue())
+            self.assertFalse(output.exists())
+
+    def test_cli_empty_secret_aegis_fails_even_next_to_valid_entry(self):
+        aegis_data = {
+            "version": 1,
+            "header": {"slots": None, "params": None},
+            "db": {
+                "version": 2,
+                "entries": [
+                    {
+                        "type": "totp",
+                        "name": "GoodAegisAcct",
+                        "issuer": "Good",
+                        "info": {"secret": DEMO_SECRET_B32, "algo": "SHA1", "digits": 6, "period": 30},
+                    },
+                    {
+                        "type": "totp",
+                        "name": "EmptyAegisAcct",
+                        "issuer": "Bad",
+                        "info": {"secret": "", "algo": "SHA1", "digits": 6, "period": 30},
+                    },
+                ],
+            },
+        }
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td) / "aegis.json"
+            source.write_text(json.dumps(aegis_data), encoding="utf-8")
+            output = Path(td) / "out.csv"
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                rc = m.main([str(source), "-o", str(output), "-f", "aegis"])
+            self.assertNotEqual(rc, 0)
+            self.assertIn("Invalid secret for EmptyAegisAcct", stdout.getvalue())
+            self.assertFalse(output.exists())
+
+            # Verify quiet mode suppresses account name
+            stdout_q = io.StringIO()
+            stderr_q = io.StringIO()
+            with contextlib.redirect_stdout(stdout_q), contextlib.redirect_stderr(stderr_q):
+                rc_q = m.main([str(source), "-o", str(output), "-f", "aegis", "-q"])
+            self.assertNotEqual(rc_q, 0)
+            self.assertIn("Invalid secret for entry", stdout_q.getvalue())
+            self.assertNotIn("EmptyAegisAcct", stdout_q.getvalue())
+            self.assertNotIn("EmptyAegisAcct", stderr_q.getvalue())
+            self.assertFalse(output.exists())
+
+    def test_cli_empty_secret_authy_fails_even_next_to_valid_entry(self):
+        authy_data = {
+            "authenticator_tokens": [
+                {
+                    "name": "GoodAuthyAcct",
+                    "issuer": "Good",
+                    "decrypted_seed": DEMO_SECRET_B32,
+                    "digits": 6,
+                },
+                {
+                    "name": "EmptyAuthyAcct",
+                    "issuer": "Bad",
+                    "decrypted_seed": "",
+                    "digits": 6,
+                },
+            ]
+        }
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td) / "authy.json"
+            source.write_text(json.dumps(authy_data), encoding="utf-8")
+            output = Path(td) / "out.csv"
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                rc = m.main([str(source), "-o", str(output), "-f", "authy"])
+            self.assertNotEqual(rc, 0)
+            self.assertIn("Invalid secret for EmptyAuthyAcct", stdout.getvalue())
+            self.assertFalse(output.exists())
+
+            # Verify quiet mode suppresses account name
+            stdout_q = io.StringIO()
+            stderr_q = io.StringIO()
+            with contextlib.redirect_stdout(stdout_q), contextlib.redirect_stderr(stderr_q):
+                rc_q = m.main([str(source), "-o", str(output), "-f", "authy", "-q"])
+            self.assertNotEqual(rc_q, 0)
+            self.assertIn("Invalid secret for entry", stdout_q.getvalue())
+            self.assertNotIn("EmptyAuthyAcct", stdout_q.getvalue())
+            self.assertNotIn("EmptyAuthyAcct", stderr_q.getvalue())
+            self.assertFalse(output.exists())
+
+    def test_directory_import_with_bad_file_reports_error_without_aborting_others(self):
+        with tempfile.TemporaryDirectory() as td:
+            directory = Path(td) / "imports"
+            directory.mkdir()
+            good_file = directory / "good.txt"
+            good_file.write_text(
+                f"otpauth://totp/ValidAcct:user@example.com?secret={DEMO_SECRET_B32}&issuer=ValidAcct",
+                encoding="utf-8",
+            )
+            bad_file = directory / "bad_encrypted.json"
+            bad_file.write_text(
+                json.dumps({"header": {"slots": [{"type": "raw"}]}, "db": "ciphertext"}),
+                encoding="utf-8",
+            )
+            output = Path(td) / "out.csv"
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                rc = m.main([str(directory), "-o", str(output)])
+            self.assertNotEqual(rc, 0)
+            self.assertIn("appears encrypted", stdout.getvalue())
+            self.assertIn("1 file(s) had errors", stderr.getvalue())
+            self.assertTrue(output.exists())
+            with output.open(newline="", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["login_username"], "user@example.com")
 
     def test_cli_exports_hotp_metadata_for_each_source(self):
         fixtures = [

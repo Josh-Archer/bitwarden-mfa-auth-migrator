@@ -96,7 +96,7 @@ Tokens that only contain `encrypted_seed` (no plaintext secret) are skipped; if 
 
 > Prefer converting Authy output to `otpauth://` lines if your export tool supports that—the otpauth path is the most portable.
 
-By default the tool writes a Bitwarden-compatible CSV locally. Use `--import-bw` to create login items directly through the Bitwarden CLI. The direct path reads the session from `BW_SESSION`; it never accepts the session key as a command-line argument. Account labels are only printed if you omit `--quiet`.
+By default the tool writes a Bitwarden-compatible CSV locally (`bitwarden_import.csv`). Use `--import-bw` to create login items directly through the Bitwarden CLI. The direct path reads the session from `BW_SESSION`; it never accepts the session key as a command-line argument. `--output` and `--bw-folder` choose the CSV path and destination folder. Account labels are only printed if you omit `--quiet`; under `--quiet`, errors and warnings refer to a generic `entry` label instead.
 
 Install and unlock the [Bitwarden CLI](https://bitwarden.com/help/cli/) first, then run:
 
@@ -117,14 +117,14 @@ python ga_to_bitwarden.py --live [--import-bw [--dry-run]] [-o out.csv] [--bw-fo
 
 | Option | Description |
 |--------|-------------|
-| `input` | Image, plain `otpauth://` URI list, unencrypted Aegis JSON, decrypted Authy JSON, or a directory of supported files |
+| `input` | Image, plain `otpauth://` URI list, unencrypted Aegis JSON, decrypted Authy JSON, or a directory of supported files (in directory mode, valid files are still exported, or imported with `--import-bw`, even if one file reports errors, and the command exits non-zero) |
 | `--format`, `-f` | Force format (`auto` sniffs extension + content) |
 | `--live` | Webcam QR scanning (GA migration + otpauth QRs) |
 | `--output`, `-o` | CSV output path (default: `bitwarden_import.csv`; omitted by default with `--import-bw`) |
 | `--bw-folder` | Folder column for every row. Defaults to a source-specific folder. Pass `""` for a blank folder. |
 | `--import-bw` | Create items directly through `bw`; requires an unlocked CLI session in `BW_SESSION`. |
 | `--dry-run` | With `--import-bw`, report the number of parsed accounts without invoking `bw`. |
-| `--quiet`, `-q` | Do not print account names to the console |
+| `--quiet`, `-q` | Do not print account names to the console (suppresses account names in errors/warnings) |
 | `--require-zbar` | Fail unless `pyzbar` is installed; useful when dense QR exports need ZBar |
 
 Example:
@@ -135,13 +135,17 @@ python ga_to_bitwarden.py C:\exports\ --output my_codes.csv --quiet
 
 ### Exit codes / errors
 
-When no accounts are exported, the tool reports a **distinct** error instead of a silent empty file:
+When no accounts are exported, or when invalid/empty secrets or corrupted files are encountered, the tool reports a **distinct** error instead of a silent empty file:
 
 | Situation | Error type | Typical exit code |
 |-----------|------------|-------------------|
 | pyzbar missing and no QR decoded | `MissingDependencyError` | 2 |
 | Images/QR unreadable | `UnreadableQRError` | 1 |
 | QR found but payload empty/invalid | `EmptyPayloadError` | 3 |
+| Invalid or empty secret in import | `ValueError` | 1 |
+| File read/parse failure in import | `ValueError` / `OSError` | 1 |
+
+Invalid or empty secrets report the affected account name (or generic `entry` under `--quiet`) and fail the import before any CSV is written or any Bitwarden CLI call is made. Hex-looking secrets made only of `A–F` and `2–7` decode as base32 with a warning asking to verify the account format; legacy hex strings failing base32 decode as hexadecimal with an explicit warning naming the account. In directory mode, errors from a bad file are reported without aborting export or direct import of the other valid files, while still returning a non-zero exit code.
 
 The tool also refuses to write an empty CSV.
 
