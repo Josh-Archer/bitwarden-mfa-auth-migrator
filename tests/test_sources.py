@@ -1,7 +1,9 @@
 """Tests for Authy / Aegis / otpauth URI source parsers (fixture data only)."""
 
 import base64
+import contextlib
 import csv
+import io
 import json
 import os
 import sys
@@ -13,7 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-import ga_to_bitwarden as m  # noqa: E402
+import ga_to_bitwarden as m
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -64,6 +66,30 @@ class TestOtpauthUri(unittest.TestCase):
 
     def test_missing_secret(self):
         self.assertIsNone(m.parse_otpauth_uri("otpauth://totp/NoSecret?issuer=X"))
+
+    def test_invalid_secret_rejected_with_account_name(self):
+        uri = "otpauth://totp/BadAccount?secret=NOT-BASE32-!!"
+        with self.assertRaisesRegex(ValueError, "Invalid secret for BadAccount"):
+            m.parse_otpauth_uri(uri)
+
+    def test_hex_looking_secret_warns_before_legacy_conversion(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            account = m.make_account("0123456789abcdef", name="Hex account")
+        self.assertEqual(account["secret"], bytes.fromhex("0123456789abcdef"))
+        self.assertIn("interpreting a hex-looking secret as hexadecimal", stderr.getvalue())
+        self.assertNotIn("0123456789abcdef", stderr.getvalue())
+
+    def test_invalid_digits_and_period_warn_when_using_defaults(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            account = m.make_account(
+                DEMO_SECRET_B32, name="Odd parameters", digits="abc", period="xyz"
+            )
+        self.assertEqual(account["digits"], 6)
+        self.assertEqual(account["period"], 30)
+        self.assertIn("Invalid digits for Odd parameters", stderr.getvalue())
+        self.assertIn("Invalid period for Odd parameters", stderr.getvalue())
 
     def test_text_file_multiple_uris(self):
         text = f"""
@@ -119,6 +145,26 @@ class TestAegis(unittest.TestCase):
         fmt = m.detect_format(str(path))
         self.assertEqual(fmt, "aegis")
 
+    def test_invalid_secret_rejected_with_entry_name(self):
+        data = {"db": {"entries": [{"name": "Bad Aegis", "info": {"secret": "BAD!!"}}]}}
+        with self.assertRaisesRegex(ValueError, "Invalid secret for Bad Aegis"):
+            m.parse_aegis_export(data)
+
+    def test_encrypted_auto_detection_and_cli_error(self):
+        data = {"header": {"slots": [{"type": "raw"}]}, "db": "ciphertext"}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "encrypted.json"
+            path.write_text(json.dumps(data), encoding="utf-8")
+            self.assertEqual(m.detect_format(str(path)), "aegis")
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            output = Path(tmp) / "out.csv"
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                rc = m.main([str(path), "-o", str(output), "-q"])
+            self.assertNotEqual(rc, 0)
+            self.assertIn("appears encrypted", stdout.getvalue())
+            self.assertFalse(output.exists())
+
 
 class TestAuthy(unittest.TestCase):
     def test_authenticator_tokens_shape(self):
@@ -144,6 +190,11 @@ class TestAuthy(unittest.TestCase):
         accounts = m.parse_authy_export(data)
         self.assertEqual(len(accounts), 2)
         self.assertEqual(accounts[1]["digits"], 7)
+
+    def test_invalid_secret_rejected_with_token_name(self):
+        data = [{"name": "Bad Authy", "secret": "BAD!!"}]
+        with self.assertRaisesRegex(ValueError, "Invalid secret for Bad Authy"):
+            m.parse_authy_export(data)
 
     def test_encrypted_only_raises(self):
         data = {"authenticator_tokens": [{"name": "X", "encrypted_seed": "abc"}]}
@@ -173,6 +224,15 @@ class TestGaMigrationBridge(unittest.TestCase):
 
 
 class TestCsvExport(unittest.TestCase):
+    def test_empty_secret_is_rejected_before_csv_is_opened(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "out.csv"
+            with self.assertRaisesRegex(ValueError, "Invalid secret for Broken account"):
+                m.export_accounts_to_csv(
+                    [{"name": "Broken account", "secret": b""}], str(out)
+                )
+            self.assertFalse(out.exists())
+
     def test_export_default_and_nondefault(self):
         accounts = [
             m.make_account(DEMO_SECRET_B32, name="a", issuer="Ex", source="otpauth-uri"),
@@ -238,6 +298,45 @@ class TestCliEndToEnd(unittest.TestCase):
             self.assertEqual(row["login_username"], "counter-user")
             self.assertTrue(row["login_totp"].startswith("otpauth://hotp/"))
             self.assertIn("counter=5", row["login_totp"])
+
+    def test_cli_auto_detects_each_file_in_directory(self):
+        with tempfile.TemporaryDirectory() as td:
+            directory = Path(td) / "imports"
+            directory.mkdir()
+            (directory / "aegis.json").write_text(
+                (FIXTURES / "aegis_export.json").read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            (directory / "authy.json").write_text(
+                (FIXTURES / "authy_export.json").read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            (directory / "uris.txt").write_text(
+                f"otpauth://totp/Example:directory?secret={DEMO_SECRET_B32}",
+                encoding="utf-8",
+            )
+            output = Path(td) / "out.csv"
+            rc = m.main([str(directory), "-o", str(output), "-q"])
+            self.assertEqual(rc, 0)
+            with output.open(newline="", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+            self.assertEqual(len(rows), 7)
+
+    def test_invalid_cli_secret_fails_without_empty_totp_or_success(self):
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td) / "invalid.txt"
+            source.write_text(
+                "otpauth://totp/BadAccount?secret=NOT-BASE32-!!", encoding="utf-8"
+            )
+            output = Path(td) / "out.csv"
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                rc = m.main([str(source), "-o", str(output), "-q"])
+            self.assertNotEqual(rc, 0)
+            self.assertIn("Invalid secret for BadAccount", stdout.getvalue())
+            self.assertNotIn("Successfully exported", stdout.getvalue())
+            self.assertFalse(output.exists())
 
     def test_cli_exports_hotp_metadata_for_each_source(self):
         fixtures = [

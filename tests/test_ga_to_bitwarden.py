@@ -19,8 +19,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import ga_to_bitwarden as m  # noqa: E402
-from tests.protobuf_fixtures import (  # noqa: E402
+import ga_to_bitwarden as m
+from tests.protobuf_fixtures import (
     migration_url_from_payload,
     sample_accounts_payload,
 )
@@ -323,13 +323,13 @@ class TestLiveScan(unittest.TestCase):
         )
         mock_qr.return_value = [invalid_uri]
 
-        with mock.patch("sys.stdout", new_callable=io.StringIO) as mock_out:
-            with mock.patch(
-                "sys.stderr", new_callable=io.StringIO
-            ) as mock_err:
-                results = m.live_scan(quiet=False)
-                stdout = mock_out.getvalue()
-                stderr = mock_err.getvalue()
+        with (
+            mock.patch("sys.stdout", new_callable=io.StringIO) as mock_out,
+            mock.patch("sys.stderr", new_callable=io.StringIO) as mock_err,
+        ):
+            results = m.live_scan(quiet=False)
+            stdout = mock_out.getvalue()
+            stderr = mock_err.getvalue()
 
         self.assertEqual(results, [])
         self.assertNotIn(placeholder_secret, stdout)
@@ -357,13 +357,13 @@ class TestLiveScan(unittest.TestCase):
         )
         mock_qr.return_value = [corrupt_uri]
 
-        with mock.patch("sys.stdout", new_callable=io.StringIO) as mock_out:
-            with mock.patch(
-                "sys.stderr", new_callable=io.StringIO
-            ) as mock_err:
-                results = m.live_scan(quiet=False)
-                stdout = mock_out.getvalue()
-                stderr = mock_err.getvalue()
+        with (
+            mock.patch("sys.stdout", new_callable=io.StringIO) as mock_out,
+            mock.patch("sys.stderr", new_callable=io.StringIO) as mock_err,
+        ):
+            results = m.live_scan(quiet=False)
+            stdout = mock_out.getvalue()
+            stderr = mock_err.getvalue()
 
         self.assertEqual(results, [])
         self.assertNotIn(placeholder_secret, stdout)

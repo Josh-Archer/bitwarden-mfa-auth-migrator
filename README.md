@@ -8,7 +8,7 @@ A Python tool to migrate TOTP/HOTP secrets from common authenticator apps into a
 - **Webcam Support**: Live scanning of QR codes directly from your phone screen.
 - **Robust Parsing**: Uses `pyzbar` and advanced image enhancement to read dense/blurry QR codes.
 - **Secure**: Runs locally. Can suppress PII output with `--quiet`.
-- **Full TOTP params**: Exports `otpauth://` URIs preserving algorithm (SHA1/SHA256/SHA512), digits (6/8), type (TOTP/HOTP), and HOTP counter—not secret-only defaults.
+- **Full TOTP params**: Preserves non-default algorithm, digits, period, and HOTP settings in `otpauth://` URIs. Standard TOTP entries use a bare base32 secret.
 
 ## Prerequisites
 
@@ -113,6 +113,7 @@ python ga_to_bitwarden.py --live [-o out.csv] [--bw-folder NAME] [-q]
 | `--output`, `-o` | Output CSV path (default: `bitwarden_import.csv`) |
 | `--bw-folder` | Folder column for every row. Defaults to a source-specific folder. Pass `""` for a blank folder. |
 | `--quiet`, `-q` | Do not print account names to the console |
+| `--require-zbar` | Fail unless `pyzbar` is installed; useful when dense QR exports need ZBar |
 
 Example:
 
@@ -167,15 +168,16 @@ defaults use the bare base32 secret. URI parameters include:
 | `period`    | TOTP period, default `30` (not applicable to HOTP) |
 | `counter`   | HOTP only (from export when present) |
 
-Writing the full URI ensures non-default algorithms and digit counts survive
-import. A bare secret alone would force Bitwarden’s defaults (SHA1, 6 digits)
-and break those accounts.
+The full URI is written when non-default settings need to be preserved,
+including every HOTP entry. Standard TOTP entries use a bare base32 secret.
+A bare secret uses Bitwarden’s defaults (SHA1, 6 digits, 30-second period).
 
 The same values are also kept as their own CSV columns — `issuer`, `algorithm`,
 `digits`, `period`, and `counter` — so they are not dropped when a row is
 written. Bitwarden’s importer reads TOTP settings from `login_totp` and ignores
-the extra columns. The `folder` column is `Google Authenticator Migration`
-unless you pass `--bw-folder`.
+the extra columns. By default, entries go into a source-specific folder:
+`Google Authenticator Migration`, `Aegis Migration`, `Authy Migration`, or
+`otpauth URI Import`. Pass `--bw-folder` to choose one folder for every row.
 
 ## ⚠️ Security Warning
 

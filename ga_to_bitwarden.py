@@ -7,7 +7,6 @@ import csv
 import json
 import os
 import re
-import struct
 import sys
 import urllib.parse
 from pathlib import Path
@@ -430,6 +429,7 @@ def export_accounts_to_csv(results, output_file, folder=None):
             "No accounts to export; refusing to write an empty CSV"
         )
 
+    validate_account_secrets(results)
     with open(output_file, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
         writer.writeheader()
@@ -488,23 +488,47 @@ def classify_empty_export(*, has_images, unreadable_images, urls_seen, decode_fa
 
 
 def normalize_secret_to_bytes(secret):
-    """Accept raw bytes or base32 string; return secret bytes."""
+    """Decode a base32 secret, accepting legacy hex with an explicit warning."""
     if secret is None:
-        return b""
+        raise ValueError("secret is missing")
     if isinstance(secret, (bytes, bytearray)):
+        if not secret:
+            raise ValueError("secret is empty")
         return bytes(secret)
     s = str(secret).strip().replace(" ", "").upper()
+    if not s:
+        raise ValueError("secret is empty")
     # pad base32
     pad = (-len(s)) % 8
     s += "=" * pad
     try:
-        return base64.b32decode(s, casefold=True)
-    except Exception:
-        # Some exports store hex; try that as a fallback
+        decoded = base64.b32decode(s, casefold=True)
+        if decoded:
+            return decoded
+    except (ValueError, TypeError):
+        pass
+
+    raw = str(secret).strip()
+    if re.fullmatch(r"[0-9a-fA-F]+", raw) and len(raw) % 2 == 0:
+        print(
+            "[Warning] Secret is not valid base32; interpreting a hex-looking "
+            "secret as hexadecimal. Verify this account's secret format.",
+            file=sys.stderr,
+        )
+        decoded = bytes.fromhex(raw)
+        if decoded:
+            return decoded
+    raise ValueError("secret is not valid base32")
+
+
+def validate_account_secrets(accounts):
+    """Reject malformed or empty secrets before any CSV file is opened."""
+    for account in accounts:
+        name = account.get("name") or "Unknown"
         try:
-            return bytes.fromhex(str(secret).strip())
-        except Exception:
-            return b""
+            normalize_secret_to_bytes(account.get("secret"))
+        except ValueError as exc:
+            raise ValueError(f"Invalid secret for {name}: {exc}") from exc
 
 def secret_to_b32(secret_bytes):
     if not secret_bytes:
@@ -525,15 +549,26 @@ def make_account(
     source="",
     notes="",
 ):
-    secret_bytes = normalize_secret_to_bytes(secret)
+    try:
+        secret_bytes = normalize_secret_to_bytes(secret)
+    except ValueError as exc:
+        raise ValueError(f"Invalid secret for {name or 'Unknown'}: {exc}") from exc
     algo = (algorithm or "SHA1").upper().replace("SHA-1", "SHA1").replace("SHA-256", "SHA256").replace("SHA-512", "SHA512")
     try:
         digits = int(digits) if digits not in (None, "") else 6
     except (TypeError, ValueError):
+        print(
+            f"[Warning] Invalid digits for {name or 'Unknown'}; using 6.",
+            file=sys.stderr,
+        )
         digits = 6
     try:
         period = int(period) if period not in (None, "") else 30
     except (TypeError, ValueError):
+        print(
+            f"[Warning] Invalid period for {name or 'Unknown'}; using 30.",
+            file=sys.stderr,
+        )
         period = 30
     try:
         counter = int(counter) if counter not in (None, "") else 0
@@ -673,7 +708,9 @@ def parse_aegis_export(data):
         # Some tools dump just the db object
         db = data
     if not isinstance(db, dict):
-        raise ValueError("Not a recognized Aegis export (missing 'db' object).")
+        raise ValueError(  # noqa: TRY004 - malformed user data is a parse error
+            "Not a recognized Aegis export (missing 'db' object)."
+        )
 
     entries = db.get("entries")
     if entries is None:
@@ -707,6 +744,9 @@ def parse_aegis_export(data):
 def is_aegis_export(data):
     if not isinstance(data, dict):
         return False
+    # Encrypted exports retain the Aegis header but store db as ciphertext.
+    if isinstance(data.get("header"), dict) and data["header"].get("slots") is not None:
+        return True
     if "db" in data and isinstance(data.get("db"), dict) and "entries" in data["db"]:
         return True
     # bare db
@@ -852,6 +892,7 @@ def export_bitwarden_csv(accounts, output_file, folder=None):
     that default (see ``_SOURCE_FOLDER_NAMES``). ``""`` writes a blank folder.
     Issuer, algorithm, digits, period, and counter are always written as columns.
     """
+    validate_account_secrets(accounts)
     with open(output_file, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
         writer.writeheader()
@@ -898,6 +939,7 @@ def export_bitwarden_csv(accounts, output_file, folder=None):
 
 def write_bitwarden_csv(results, output_file, folder=None):
     """Write OTP params to a Bitwarden-compatible CSV with full otpauth URIs."""
+    validate_account_secrets(results)
     with open(output_file, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
         writer.writeheader()
@@ -990,17 +1032,17 @@ def get_qr_payloads(image):
         detector = cv2.QRCodeDetector()
         # Multi first
         try:
-            retval, decoded_info, points, _ = detector.detectAndDecodeMulti(image)
+            retval, decoded_info, _points, _ = detector.detectAndDecodeMulti(image)
             if retval and decoded_info:
                 for info in decoded_info:
                     _add(info)
-        except Exception:
+        except cv2.error:
             pass
         if not payloads:
             try:
-                info, points, _ = detector.detectAndDecode(image)
+                info, _points, _ = detector.detectAndDecode(image)
                 _add(info)
-            except Exception:
+            except cv2.error:
                 pass
 
     return payloads
@@ -1059,24 +1101,25 @@ def detect_format(path, explicit=None):
             # JSON might be a list of otpauth strings
             if isinstance(data, list) and data and isinstance(data[0], str) and "otpauth" in data[0]:
                 return "otpauth"
-        except Exception:
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             pass
         return "json-unknown"
     # try content sniff for extensionless / .csv etc.
     try:
         with open(path, "r", encoding="utf-8") as f:
-            head = f.read(4096)
+            text = f.read()
+        head = text[:4096]
         if "otpauth://" in head or "otpauth-migration://" in head:
             return "otpauth"
         try:
-            data = json.loads(head if head.strip().startswith("{") or head.strip().startswith("[") else open(path, encoding="utf-8").read())
+            data = json.loads(text)
             if is_aegis_export(data):
                 return "aegis"
             if is_authy_export(data):
                 return "authy"
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             pass
-    except Exception:
+    except (OSError, UnicodeDecodeError):
         pass
     return "auto"
 
@@ -1093,7 +1136,7 @@ def load_accounts_from_file(path, fmt="auto", quiet=False):
             data = json.loads(text)
             if isinstance(data, list) and all(isinstance(x, str) for x in data):
                 text = "\n".join(data)
-        except Exception:
+        except json.JSONDecodeError:
             pass
         return parse_otpauth_text(text)
     if fmt == "aegis":
@@ -1269,25 +1312,16 @@ def main(argv=None):
         return 2
 
     # Multi-source file loaders for non-QR formats (and auto when not an image).
-    auto_file_format = None
-    if (
-        not args.live
-        and args.format == "auto"
-        and args.input
-        and os.path.isfile(args.input)
-    ):
-        auto_file_format = detect_format(args.input)
     if (
         not args.live
         and args.input
         and (
-            args.format in ("otpauth", "aegis", "authy")
+            (os.path.isdir(args.input) and args.format == "auto")
+            or args.format in ("otpauth", "aegis", "authy")
             or (
                 args.format == "auto"
-                and (
-                    Path(args.input).suffix.lower() in (TEXT_EXTENSIONS | JSON_EXTENSIONS)
-                    or auto_file_format in ("otpauth", "aegis", "authy")
-                )
+                and os.path.isfile(args.input)
+                and detect_format(args.input) not in ("qr", "auto")
             )
         )
     ):
@@ -1296,7 +1330,8 @@ def main(argv=None):
             print(f"Error: Path not found: {path}", file=sys.stderr)
             return 1
         files = []
-        if os.path.isdir(path):
+        is_directory = os.path.isdir(path)
+        if is_directory:
             for f in sorted(os.listdir(path)):
                 full = os.path.join(path, f)
                 if os.path.isfile(full):
@@ -1304,19 +1339,33 @@ def main(argv=None):
         else:
             files = [path]
         results = []
+        file_errors = []
         print(f"Found {len(files)} file(s) to process.")
         for file_path in files:
             print(f"\n-- Processing: {os.path.basename(file_path)}")
+            if is_directory and args.format == "auto":
+                detected = detect_format(file_path)
+                if detected in ("auto", "json-unknown"):
+                    print("  [Warning] Skipping an unsupported file format.")
+                    continue
             try:
                 accts = load_accounts_from_file(file_path, fmt=args.format, quiet=args.quiet)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - parser failures vary by source format
                 print(f"  [Error] {e}")
+                file_errors.append((file_path, str(e)))
                 continue
             if not accts:
                 print("  [!] No accounts found in this file.")
             else:
                 print(f"  [Success] {len(accts)} account(s) from this file.")
                 results.extend(accts)
+        if file_errors:
+            print(
+                f"\nImport failed: {len(file_errors)} file(s) had errors; "
+                "no CSV was written.",
+                file=sys.stderr,
+            )
+            return 1
         if not results:
             print("\nNo accounts extracted.", file=sys.stderr)
             return 1
@@ -1325,7 +1374,7 @@ def main(argv=None):
             export_bitwarden_csv(results, out, folder=args.bw_folder)
             print(f"\nSuccessfully exported {len(results)} accounts to {out}")
             return 0
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - CSV serialization may raise multiple errors
             print(f"Error writing CSV file: {e}", file=sys.stderr)
             return 1
 
@@ -1393,7 +1442,7 @@ def main(argv=None):
             print(f"\n-- Processing: {os.path.basename(image_path)}")
             img = cv2.imread(image_path)
             if img is None:
-                print(f"  [Error] Could not read image (unreadable or unsupported format).")
+                print("  [Error] Could not read image (unreadable or unsupported format).")
                 unreadable_images += 1
                 continue
 
@@ -1439,7 +1488,7 @@ def main(argv=None):
                             print(f"  [+] Extracted {len(otp_list)} accounts from this batch using {label} mode.")
             
             if found_in_this_file == 0:
-                print(f"  [!] No NEW QR codes with valid accounts detected in this file.")
+                print("  [!] No NEW QR codes with valid accounts detected in this file.")
             else:
                 print(f"  [Success] Total {found_in_this_file} new accounts found in this file.")
 
@@ -1472,7 +1521,7 @@ def main(argv=None):
     except EmptyPayloadError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 3
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - surface CSV write failures to the CLI
         print(f"Error writing CSV file: {e}", file=sys.stderr)
         return 1
 
