@@ -117,7 +117,7 @@ python ga_to_bitwarden.py --live [--import-bw [--dry-run]] [-o out.csv] [--bw-fo
 
 | Option | Description |
 |--------|-------------|
-| `input` | Image, plain `otpauth://` URI list, unencrypted Aegis JSON, decrypted Authy JSON, or a directory of supported files (in directory mode, valid files are still exported, or imported with `--import-bw`, even if one file reports errors, with a non-zero exit; if any `.json` is truncated or corrupt, no CSV is written and `-o` is left untouched) |
+| `input` | Image, plain `otpauth://` URI list, unencrypted Aegis JSON, decrypted Authy JSON, or a directory of supported files (if any supported file reports an error, no CSV is written, no direct import is attempted, and an existing `-o` is left untouched) |
 | `--format`, `-f` | Force format (`auto` sniffs extension + content) |
 | `--live` | Webcam QR scanning (GA migration + otpauth QRs) |
 | `--output`, `-o` | CSV output path (default: `bitwarden_import.csv`; omitted by default with `--import-bw`) |
@@ -145,7 +145,7 @@ When no accounts are exported, or when invalid/empty secrets or corrupted files 
 | Invalid or empty secret in import | `ValueError` | 1 |
 | File read/parse failure in import | `ValueError` / `OSError` | 1 |
 
-Invalid or empty secrets report the affected account name (or generic `entry` under `--quiet`) and fail the import before any CSV is written or any Bitwarden CLI call is made. Hex-looking secrets made only of `A–F` and `2–7` decode as base32 with a warning asking to verify the account format; legacy hex strings failing base32 decode as hexadecimal with an explicit warning naming the account. In directory mode, errors from a bad file are reported without aborting the export or direct import of other valid files (with partial export overwriting an existing `-o` file), while still returning a non-zero exit code. However, if any `.json` inside the directory is truncated or corrupt, the run exits non-zero and does not write or overwrite the `-o` output. All error lines, warnings, and summary error messages are emitted to stderr.
+Invalid or empty secrets report the affected account name (or generic `entry` under `--quiet`) and fail the import before any CSV is written or any Bitwarden CLI call is made. Hex-looking secrets made only of `A–F` and `2–7` decode as base32 with a warning asking to verify the account format; legacy hex strings failing base32 decode as hexadecimal with an explicit warning naming the account. In directory mode, files with errors are reported while valid files are still parsed, but no CSV is written and no direct import is attempted; an existing `-o` file is left untouched. CSV files are written to a temporary file and replace the destination only after the complete export succeeds. All error lines, warnings, and summary error messages are emitted to stderr.
 
 The tool also refuses to write an empty CSV.
 
@@ -155,13 +155,15 @@ The tool also refuses to write an empty CSV.
 
 Use `--import-bw` with an unlocked Bitwarden CLI session as shown above. Items are created as login entries with the OTP URI, username, notes, and folder. The tool reports success and failure counts; a partial failure returns exit code `2`. Failed account labels are omitted with `--quiet`. CLI output is not printed because it can contain vault data.
 
+Re-running an import creates duplicate items; review the destination folder before retrying a completed import.
+
 ### CSV import
 
 1. Log in to your Web Vault.
 2. Go to **Tools → Import Data**.
 3. Select **Bitwarden (csv)** as the file format.
 4. Upload the generated CSV file.
-5. **Delete the CSV** after verifying codes work.
+5. **Delete the CSV** after verifying codes work. The CSV contains TOTP secrets in plaintext.
 
 ## Tests
 

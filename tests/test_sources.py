@@ -506,7 +506,7 @@ class TestCliEndToEnd(unittest.TestCase):
             self.assertNotIn("EmptyAuthyAcct", stderr_q.getvalue())
             self.assertFalse(output.exists())
 
-    def test_directory_import_with_bad_file_reports_error_without_aborting_others(self):
+    def test_directory_import_with_bad_file_does_not_write_partial_csv(self):
         with tempfile.TemporaryDirectory() as td:
             directory = Path(td) / "imports"
             directory.mkdir()
@@ -521,6 +521,7 @@ class TestCliEndToEnd(unittest.TestCase):
                 encoding="utf-8",
             )
             output = Path(td) / "out.csv"
+            output.write_text("PREEXISTING_CONTENT_DO_NOT_OVERWRITE", encoding="utf-8")
             stdout = io.StringIO()
             stderr = io.StringIO()
             with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
@@ -529,12 +530,34 @@ class TestCliEndToEnd(unittest.TestCase):
             self.assertIn("appears encrypted", stderr.getvalue())
             self.assertIn("1 file(s) had errors", stderr.getvalue())
             self.assertIn("bad_encrypted.json", stderr.getvalue())
-            self.assertIn("out.csv is PARTIAL: excludes bad_encrypted.json", stderr.getvalue())
-            self.assertTrue(output.exists())
-            with output.open(newline="", encoding="utf-8") as f:
-                rows = list(csv.DictReader(f))
-            self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0]["login_username"], "user@example.com")
+            self.assertIn("no CSV was written", stderr.getvalue())
+            self.assertEqual(
+                output.read_text(encoding="utf-8"), "PREEXISTING_CONTENT_DO_NOT_OVERWRITE"
+            )
+
+    def test_directory_with_unreadable_image_does_not_write_partial_csv(self):
+        with tempfile.TemporaryDirectory() as td:
+            directory = Path(td) / "imports"
+            directory.mkdir()
+            good_file = directory / "good.txt"
+            good_file.write_text(
+                f"otpauth://totp/ValidAcct:user@example.com?secret={DEMO_SECRET_B32}&issuer=ValidAcct",
+                encoding="utf-8",
+            )
+            (directory / "broken.png").write_text("not an image", encoding="utf-8")
+            output = Path(td) / "out.csv"
+            output.write_text("PREEXISTING_CONTENT_DO_NOT_OVERWRITE", encoding="utf-8")
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                rc = m.main([str(directory), "-o", str(output)])
+            self.assertNotEqual(rc, 0)
+            self.assertIn("Could not read image", stderr.getvalue())
+            self.assertIn("broken.png", stderr.getvalue())
+            self.assertIn("no CSV was written", stderr.getvalue())
+            self.assertEqual(
+                output.read_text(encoding="utf-8"), "PREEXISTING_CONTENT_DO_NOT_OVERWRITE"
+            )
 
     def test_directory_with_corrupt_json_fails_and_leaves_output_untouched(self):
         with tempfile.TemporaryDirectory() as td:

@@ -154,13 +154,15 @@ class TestDirectBitwardenImport(unittest.TestCase):
         self.assertEqual(self.run_mock.call_count, 1)
 
     def test_partial_failure_is_counted_without_cli_output(self):
-        process, _calls, _items, _folders = fake_process(fail_item_number=2)
+        process, calls, _items, _folders = fake_process(fail_item_number=2)
         self.run_mock.side_effect = process.side_effect
         created, failed = m.import_accounts_to_bitwarden(
             [sample_account(), sample_account("second-user")]
         )
         self.assertEqual(created, 1)
         self.assertEqual(failed, ["Example Service: second-user"])
+        template_calls = [call for call in calls if call[0][1:] == ["get", "template", "item"]]
+        self.assertEqual(len(template_calls), 1)
 
     def test_missing_session_fails_before_cli_call(self):
         self.env.stop()
@@ -191,6 +193,19 @@ class TestDirectBitwardenImport(unittest.TestCase):
             result = m.main([str(fixture), "--import-bw", "--dry-run", "--quiet"])
         self.assertEqual(result, 0)
         self.assertIn("would import 3 account(s)", output.getvalue())
+        self.run_mock.assert_not_called()
+
+    def test_deliver_dry_run_validates_secrets(self):
+        account = sample_account()
+        account["secret"] = b""
+        args = mock.Mock(import_bw=True, dry_run=True, output=None, bw_folder=None, quiet=True)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            result = m.deliver_accounts(args, [account])
+        self.assertEqual(result, 1)
+        self.assertIn("secret is empty", stderr.getvalue())
+        self.assertNotIn("would import", stdout.getvalue())
         self.run_mock.assert_not_called()
 
 

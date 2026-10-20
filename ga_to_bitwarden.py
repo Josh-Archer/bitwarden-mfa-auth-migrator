@@ -4,6 +4,7 @@
 
 import argparse
 import base64
+import copy
 import csv
 import json
 import os
@@ -11,7 +12,9 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import urllib.parse
+from contextlib import contextmanager
 from pathlib import Path
 
 import cv2
@@ -43,6 +46,27 @@ class EmptyPayloadError(MigrationError):
 
 class BitwardenCliError(MigrationError):
     """A safe, non-sensitive error returned by the Bitwarden CLI workflow."""
+
+
+@contextmanager
+def atomic_csv_output(output_file):
+    """Replace the destination only after a complete CSV has been written."""
+    output_path = os.fspath(output_file)
+    output_dir = os.path.dirname(os.path.abspath(output_path))
+    prefix = f".{os.path.basename(output_path)}."
+    fd, temp_path = tempfile.mkstemp(
+        prefix=prefix, suffix=".tmp", dir=output_dir, text=True
+    )
+    try:
+        with os.fdopen(fd, "w", newline="", encoding="utf-8") as output:
+            yield output
+        os.replace(temp_path, output_path)
+    except BaseException:
+        try:
+            os.unlink(temp_path)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 class ProtobufParseError(ValueError):
@@ -437,7 +461,7 @@ def export_accounts_to_csv(results, output_file, folder=None, quiet=False):
         )
 
     validate_account_secrets(results, quiet=quiet)
-    with open(output_file, "w", newline="", encoding="utf-8") as f:
+    with atomic_csv_output(output_file) as f:
         writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
         writer.writeheader()
         for otp in results:
@@ -931,7 +955,7 @@ def export_bitwarden_csv(accounts, output_file, folder=None, quiet=False):
     Issuer, algorithm, digits, period, and counter are always written as columns.
     """
     validate_account_secrets(accounts, quiet=quiet)
-    with open(output_file, "w", newline="", encoding="utf-8") as f:
+    with atomic_csv_output(output_file) as f:
         writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
         writer.writeheader()
 
@@ -983,7 +1007,7 @@ def export_bitwarden_csv(accounts, output_file, folder=None, quiet=False):
 def write_bitwarden_csv(results, output_file, folder=None, quiet=False):
     """Write OTP params to a Bitwarden-compatible CSV with full otpauth URIs."""
     validate_account_secrets(results, quiet=quiet)
-    with open(output_file, "w", newline="", encoding="utf-8") as f:
+    with atomic_csv_output(output_file) as f:
         writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
         writer.writeheader()
         for otp in results:
@@ -1104,6 +1128,7 @@ def import_accounts_to_bitwarden(accounts, *, folder=None, quiet=False, dry_run=
 
     created = 0
     failed = []
+    item_template = None
     for account in accounts:
         label = account.get("name") or "Unknown"
         issuer = account.get("issuer") or ""
@@ -1111,12 +1136,16 @@ def import_accounts_to_bitwarden(accounts, *, folder=None, quiet=False, dry_run=
             label = f"{issuer}: {label}"
         try:
             item = _bw_item_from_account(account, folder_id, folder=effective_folder)
-            template = json.loads(_bw_cli_run(["get", "template", "item"], bw_path=bw_path))
-            if not isinstance(template, dict):
-                raise BitwardenCliError("Bitwarden returned an invalid login item template.")
+            if item_template is None:
+                item_template = json.loads(
+                    _bw_cli_run(["get", "template", "item"], bw_path=bw_path)
+                )
+                if not isinstance(item_template, dict):
+                    raise BitwardenCliError("Bitwarden returned an invalid login item template.")
+                if not isinstance(item_template.get("login"), dict):
+                    raise BitwardenCliError("Bitwarden returned an invalid login item template.")
+            template = copy.deepcopy(item_template)
             login = template.get("login")
-            if not isinstance(login, dict):
-                raise BitwardenCliError("Bitwarden returned an invalid login item template.")
             login.update(item["login"])
             item["login"] = login
             template.update(item)
@@ -1127,7 +1156,7 @@ def import_accounts_to_bitwarden(accounts, *, folder=None, quiet=False, dry_run=
     return created, failed
 
 
-def deliver_accounts(args, accounts, has_file_errors=False):
+def deliver_accounts(args, accounts):
     """Write a CSV, import directly, or report a dry run for parsed accounts."""
     def write_optional_csv(path):
         if any(account.get("source") for account in accounts):
@@ -1141,6 +1170,11 @@ def deliver_accounts(args, accounts, has_file_errors=False):
 
     if args.import_bw:
         if args.dry_run:
+            try:
+                validate_account_secrets(accounts, quiet=args.quiet)
+            except ValueError as exc:
+                print(f"Error importing to Bitwarden: {exc}", file=sys.stderr)
+                return 1
             print(f"Dry run: would import {len(accounts)} account(s) to Bitwarden.")
             return 0
         try:
@@ -1167,10 +1201,17 @@ def deliver_accounts(args, accounts, has_file_errors=False):
     output_file = args.output or "bitwarden_import.csv"
     try:
         write_optional_csv(output_file)
-        if not has_file_errors:
-            print(f"\nSuccessfully exported {len(accounts)} accounts to {output_file}")
+        print(f"\nSuccessfully exported {len(accounts)} accounts to {output_file}")
+        print("Next steps:")
+        print("1. Open Vaultwarden Web Vault")
+        print("2. Go to Tools -> Import Data")
+        print(f"3. Select 'Bitwarden (csv)' and upload {output_file}")
+        print("4. IMPORTANT: Delete the CSV file after verification!")
         return 0
-    except (OSError, ValueError, EmptyPayloadError, csv.Error) as exc:
+    except EmptyPayloadError as exc:
+        print(f"Error writing CSV file: {exc}", file=sys.stderr)
+        return 3
+    except (OSError, ValueError, csv.Error) as exc:
         print(f"Error writing CSV file: {exc}", file=sys.stderr)
         return 1
 
@@ -1401,9 +1442,9 @@ def load_accounts_from_file(path, fmt="auto", quiet=False):
 def load_accounts_from_image(path, quiet=False):
     img = cv2.imread(path)
     if img is None:
-        label = "image" if quiet else path
-        print(f"  [Error] Could not read image: {label}", file=sys.stderr)
-        return []
+        raise UnreadableQRError(
+            "Could not read image (unreadable or unsupported format)"
+        )
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     kernel = np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]])
@@ -1594,7 +1635,6 @@ def main(argv=None):
             files = [path]
         results = []
         file_errors = []
-        has_corrupt_json = False
         print(f"Found {len(files)} file(s) to process.")
         for idx, file_path in enumerate(files, 1):
             file_label = f"file #{idx}" if args.quiet else os.path.basename(file_path)
@@ -1614,12 +1654,6 @@ def main(argv=None):
                 if args.quiet:
                     err_msg = err_msg.replace(file_path, file_label).replace(os.path.basename(file_path), file_label)
                 print(f"  [Error] {err_msg}", file=sys.stderr)
-                is_corrupt = (
-                    isinstance(e, (json.JSONDecodeError, UnicodeDecodeError))
-                    or detected == "json-corrupt"
-                )
-                if is_corrupt:
-                    has_corrupt_json = True
                 file_errors.append((file_path, idx, err_msg))
                 continue
             if not accts:
@@ -1633,39 +1667,16 @@ def main(argv=None):
         ]
         failed_str = ", ".join(failed_labels)
 
-        if has_corrupt_json:
+        if file_errors:
+            detail = "nothing was imported" if args.import_bw else "no CSV was written"
             print(
                 f"\nImport failed: {len(file_errors)} file(s) had errors: {failed_str}; "
-                "no CSV was written.",
+                f"{detail}.",
                 file=sys.stderr,
             )
             return 1
-
-        # Deliver valid accounts even when other files failed, then exit
-        # non-zero. deliver_accounts covers CSV output and --import-bw.
         if results:
-            delivery_rc = deliver_accounts(args, results, has_file_errors=bool(file_errors))
-            if delivery_rc != 0:
-                return delivery_rc
-
-        if file_errors:
-            if not results:
-                print(
-                    f"\nImport failed: {len(file_errors)} file(s) had errors: {failed_str}; "
-                    "no CSV was written.",
-                    file=sys.stderr,
-                )
-            else:
-                out = args.output or "bitwarden_import.csv"
-                if not args.import_bw or args.output:
-                    print(f"\n{out} is PARTIAL: excludes {failed_str}", file=sys.stderr)
-                else:
-                    print(f"\nImport is PARTIAL: excludes {failed_str}", file=sys.stderr)
-                print(
-                    f"Import finished with errors: {len(file_errors)} file(s) had errors: {failed_str}.",
-                    file=sys.stderr,
-                )
-            return 1
+            return deliver_accounts(args, results)
 
         if not results:
             print("\nNo accounts extracted.", file=sys.stderr)
