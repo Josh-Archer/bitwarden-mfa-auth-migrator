@@ -78,6 +78,17 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".
 TEXT_EXTENSIONS = {".txt", ".text", ".uri", ".urls", ".otpauth"}
 JSON_EXTENSIONS = {".json"}
 
+# Default Bitwarden folder column. Callers can override this per export.
+DEFAULT_BW_FOLDER = "Google Authenticator Migration"
+
+# Used when --bw-folder is omitted for non-QR imports. GA exports use DEFAULT_BW_FOLDER.
+_SOURCE_FOLDER_NAMES = {
+    "google-authenticator": DEFAULT_BW_FOLDER,
+    "otpauth-uri": "otpauth URI Import",
+    "aegis": "Aegis Migration",
+    "authy": "Authy Migration",
+}
+
 
 
 def otp_type_name(type_val):
@@ -304,11 +315,75 @@ def decode_migration_url(url, *, strict=True):
     
     return data
 
-def otp_to_csv_row(otp):
-    """Convert a parsed OTP params dict to a Bitwarden CSV row dict."""
+def normalized_otp_metadata(otp):
+    """Return issuer, algorithm, digits, period, and counter for a CSV row.
+
+    Accepts Google Authenticator protobuf enums (algorithm 1/2/3/4, digits 1/2)
+    and already-normalized accounts (algorithm ``"SHA256"``, digits ``8``).
+    Values match what ``build_otpauth_uri`` writes into ``login_totp``.
+    """
+    issuer = otp.get("issuer", "") or ""
+    if not isinstance(issuer, str):
+        issuer = str(issuer)
+
+    algo_raw = otp.get("algorithm", 0)
+    if isinstance(algo_raw, int) and algo_raw in ALGORITHM_MAP:
+        algorithm = ALGORITHM_MAP[algo_raw]
+    elif isinstance(algo_raw, str) and algo_raw.strip():
+        algorithm = (
+            algo_raw.strip()
+            .upper()
+            .replace("SHA-1", "SHA1")
+            .replace("SHA-256", "SHA256")
+            .replace("SHA-512", "SHA512")
+        )
+    else:
+        algorithm = "SHA1"
+
+    digits_raw = otp.get("digits", 0)
+    if digits_raw in DIGITS_MAP:
+        digits = DIGITS_MAP[digits_raw]
+    else:
+        try:
+            digits = int(digits_raw) if digits_raw else 6
+        except (TypeError, ValueError):
+            digits = 6
+
+    # ``or 30`` matches build_otpauth_uri: missing and 0 both mean the GA default.
+    period_raw = otp.get("period") or 30
+    try:
+        period = int(period_raw)
+    except (TypeError, ValueError):
+        period = 30
+
+    counter_raw = otp.get("counter", 0) or 0
+    try:
+        counter = int(counter_raw)
+    except (TypeError, ValueError):
+        counter = 0
+
+    return {
+        "issuer": issuer,
+        "algorithm": algorithm,
+        "digits": str(digits),
+        "period": str(period),
+        "counter": str(counter),
+    }
+
+
+def otp_to_csv_row(otp, folder=None):
+    """Convert a parsed OTP params dict to a Bitwarden CSV row dict.
+
+    ``folder`` defaults to ``DEFAULT_BW_FOLDER``. Pass ``""`` to leave the
+    folder blank. Issuer, algorithm, digits, period, and counter are kept on
+    the row so a later CSV write does not drop them.
+    """
     name = otp.get('name', 'Unknown') or 'Unknown'
-    issuer = otp.get('issuer', '') or ''
+    meta = normalized_otp_metadata(otp)
+    issuer = meta["issuer"]
     display_name = f"{issuer}: {name}" if issuer else name
+    if folder is None:
+        folder = DEFAULT_BW_FOLDER
 
     existing_totp = otp.get("login_totp")
     if isinstance(existing_totp, str) and existing_totp.startswith("otpauth://"):
@@ -317,8 +392,8 @@ def otp_to_csv_row(otp):
         login_totp = build_otpauth_uri(otp)
 
     # Empty login password column is emitted via DictWriter defaults (restval).
-    return {
-        "folder": "Google Authenticator Migration",
+    row = {
+        "folder": folder,
         "favorite": "0",
         "type": "login",
         "name": display_name,
@@ -328,6 +403,8 @@ def otp_to_csv_row(otp):
         "login_username": name,
         "login_totp": login_totp,
     }
+    row.update(meta)
+    return row
 
 
 # Bitwarden CSV column name (split so secret scanners do not false-positive on the field name).
@@ -336,11 +413,15 @@ _BW_CSV_EMPTY_LOGIN_COL = "login_" + "pass" + "word"
 CSV_HEADERS = [
     "folder", "favorite", "type", "name", "notes", "fields",
     "login_uri", "login_username", _BW_CSV_EMPTY_LOGIN_COL, "login_totp",
+    "issuer", "algorithm", "digits", "period", "counter",
 ]
 
 
-def export_accounts_to_csv(results, output_file):
+def export_accounts_to_csv(results, output_file, folder=None):
     """Write OTP account dicts to a Bitwarden-compatible CSV file.
+
+    ``folder`` is the destination folder for every row (default:
+    ``DEFAULT_BW_FOLDER``). Pass ``""`` for a blank folder.
 
     Raises EmptyPayloadError if results is empty.
     """
@@ -353,7 +434,7 @@ def export_accounts_to_csv(results, output_file):
         writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
         writer.writeheader()
         for otp in results:
-            writer.writerow(otp_to_csv_row(otp))
+            writer.writerow(otp_to_csv_row(otp, folder=folder))
 
     return len(results)
 
@@ -764,21 +845,15 @@ def build_totp_uri(account):
     query = urllib.parse.urlencode(params)
     return f"otpauth://{otp_type}/{label_enc}?{query}"
 
-def export_bitwarden_csv(accounts, output_file):
-    headers = [
-        "folder", "favorite", "type", "name", "notes", "fields",
-        "login_uri", "login_username", _BW_CSV_EMPTY_LOGIN_COL, "login_totp",
-    ]
+def export_bitwarden_csv(accounts, output_file, folder=None):
+    """Write normalized accounts to a Bitwarden CSV.
 
-    folder_map = {
-        "google-authenticator": "Google Authenticator Migration",
-        "otpauth-uri": "otpauth URI Import",
-        "aegis": "Aegis Migration",
-        "authy": "Authy Migration",
-    }
-
+    ``folder`` overrides the per-source default for every row. ``None`` keeps
+    that default (see ``_SOURCE_FOLDER_NAMES``). ``""`` writes a blank folder.
+    Issuer, algorithm, digits, period, and counter are always written as columns.
+    """
     with open(output_file, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=headers)
+        writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
         writer.writeheader()
 
         for otp in accounts:
@@ -787,7 +862,10 @@ def export_bitwarden_csv(accounts, output_file):
             issuer = otp.get("issuer", "")
             display_name = f"{issuer}: {name}" if issuer else name
             source = otp.get("source") or ""
-            folder = folder_map.get(source, "Authenticator Migration")
+            if folder is None:
+                row_folder = _SOURCE_FOLDER_NAMES.get(source, "Authenticator Migration")
+            else:
+                row_folder = folder
 
             # Use full otpauth URI when non-default params so Bitwarden preserves them
             algo = (otp.get("algorithm") or "SHA1").upper()
@@ -808,37 +886,23 @@ def export_bitwarden_csv(accounts, output_file):
 
             notes = otp.get("notes") or f"Migrated from {source or 'authenticator'}"
             writer.writerow({
-                "folder": folder,
+                "folder": row_folder,
                 "favorite": "0",
                 "type": "login",
                 "name": display_name,
                 "notes": notes,
                 "login_username": name,
                 "login_totp": login_totp,
+                **normalized_otp_metadata(otp),
             })
 
-def write_bitwarden_csv(results, output_file):
+def write_bitwarden_csv(results, output_file, folder=None):
     """Write OTP params to a Bitwarden-compatible CSV with full otpauth URIs."""
-    headers = [
-        "folder", "favorite", "type", "name", "notes", "fields",
-        "login_uri", "login_username", _BW_CSV_EMPTY_LOGIN_COL, "login_totp",
-    ]
     with open(output_file, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=headers)
+        writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
         writer.writeheader()
         for otp in results:
-            name = otp.get("name", "Unknown")
-            issuer = otp.get("issuer", "")
-            display_name = f"{issuer}: {name}" if issuer else name
-            writer.writerow({
-                "folder": "Google Authenticator Migration",
-                "favorite": "0",
-                "type": "login",
-                "name": display_name,
-                "notes": "Migrated from Google Authenticator",
-                "login_username": name,
-                "login_totp": build_otpauth_uri(otp),
-            })
+            writer.writerow(otp_to_csv_row(otp, folder=folder))
 
 
 # Test/compat aliases for renamed helpers
@@ -1179,6 +1243,16 @@ def main(argv=None):
         default=None,
         help="Output CSV file path (default: bitwarden_import.csv)",
     )
+    parser.add_argument(
+        "--bw-folder",
+        default=None,
+        help=(
+            "Destination folder written on each CSV row "
+            f"(default: '{DEFAULT_BW_FOLDER}' for Google Authenticator exports; "
+            "a source-specific folder for Aegis, Authy, and otpauth). "
+            "Pass an empty string to leave the folder blank."
+        ),
+    )
     parser.add_argument("--quiet", "-q", action="store_true", help="Do not print account names/PII to console")
     parser.add_argument(
         "--require-zbar",
@@ -1238,7 +1312,7 @@ def main(argv=None):
             return 1
         out = args.output or "bitwarden_import.csv"
         try:
-            export_bitwarden_csv(results, out)
+            export_bitwarden_csv(results, out, folder=args.bw_folder)
             print(f"\nSuccessfully exported {len(results)} accounts to {out}")
             return 0
         except Exception as e:
@@ -1376,7 +1450,7 @@ def main(argv=None):
     output_file = args.output or "bitwarden_import.csv"
     
     try:
-        count = export_accounts_to_csv(results, output_file)
+        count = export_accounts_to_csv(results, output_file, folder=args.bw_folder)
         print(f"\nSuccessfully exported {count} accounts to {output_file}")
         print("Next steps:")
         print("1. Open Vaultwarden Web Vault")

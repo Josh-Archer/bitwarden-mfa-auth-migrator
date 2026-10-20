@@ -67,7 +67,7 @@ The tool never writes `BW_SESSION` or TOTP secrets to log files. Account labels 
 
 Optional flags for direct import:
 
-- `--bw-folder "My Folder"` — destination folder (default: `Google Authenticator Migration`). Use `--bw-folder ""` for no folder.
+- `--bw-folder "My Folder"` — destination folder column on each CSV row (default: `Google Authenticator Migration` for Google Authenticator exports). Aegis, Authy, and otpauth imports use a source-specific folder unless this flag is set. Use `--bw-folder ""` for a blank folder.
 - `-o path.csv` — also write a CSV **only if you explicitly request it** (not recommended; delete immediately).
 
 ### 4. Options
@@ -129,8 +129,8 @@ Tokens that only contain `encrypted_seed` (no plaintext secret) are skipped; if 
 ## Usage (CLI)
 
 ```bash
-python ga_to_bitwarden.py <input> [--format auto|qr|ga|otpauth|aegis|authy] [-o out.csv] [-q]
-python ga_to_bitwarden.py --live [-o out.csv] [-q]
+python ga_to_bitwarden.py <input> [--format auto|qr|ga|otpauth|aegis|authy] [-o out.csv] [--bw-folder NAME] [-q]
+python ga_to_bitwarden.py --live [-o out.csv] [--bw-folder NAME] [-q]
 ```
 
 | Option | Description |
@@ -139,6 +139,7 @@ python ga_to_bitwarden.py --live [-o out.csv] [-q]
 | `--format`, `-f` | Force format (`auto` sniffs extension + content) |
 | `--live` | Webcam QR scanning (GA migration + otpauth QRs) |
 | `--output`, `-o` | Output CSV path (default: `bitwarden_import.csv`) |
+| `--bw-folder` | Folder column for every row. Default for Google Authenticator exports: `Google Authenticator Migration`. Pass `""` for a blank folder. |
 | `--quiet`, `-q` | Do not print account names to the console |
 
 Example:
@@ -201,6 +202,12 @@ This tool **always writes a full `otpauth://` URI**, including:
 Writing the full URI ensures non-default algorithms and digit counts survive
 import. A bare secret alone would force Bitwarden’s defaults (SHA1, 6 digits)
 and break those accounts.
+
+The same values are also kept as their own CSV columns — `issuer`, `algorithm`,
+`digits`, `period`, and `counter` — so they are not dropped when a row is
+written. Bitwarden’s importer reads TOTP settings from `login_totp` and ignores
+the extra columns. The `folder` column is `Google Authenticator Migration`
+unless you pass `--bw-folder`.
 
 ## ⚠️ Security Warning
 
