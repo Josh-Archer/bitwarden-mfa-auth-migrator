@@ -9,7 +9,9 @@ import json
 import os
 import re
 import sys
+import tempfile
 import urllib.parse
+from contextlib import contextmanager
 from pathlib import Path
 
 import cv2
@@ -37,6 +39,27 @@ class UnreadableQRError(MigrationError):
 
 class EmptyPayloadError(MigrationError):
     """QR/URL decoded but migration payload was missing, invalid, or empty."""
+
+
+@contextmanager
+def atomic_csv_output(output_file):
+    """Write a CSV beside its destination and replace it only when complete."""
+    output_path = os.fspath(output_file)
+    output_dir = os.path.dirname(os.path.abspath(output_path))
+    prefix = f".{os.path.basename(output_path)}."
+    fd, temp_path = tempfile.mkstemp(
+        prefix=prefix, suffix=".tmp", dir=output_dir, text=True
+    )
+    try:
+        with os.fdopen(fd, "w", newline="", encoding="utf-8") as output:
+            yield output
+        os.replace(temp_path, output_path)
+    except BaseException:
+        try:
+            os.unlink(temp_path)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 class ProtobufParseError(ValueError):
@@ -431,7 +454,7 @@ def export_accounts_to_csv(results, output_file, folder=None, quiet=False):
         )
 
     validate_account_secrets(results, quiet=quiet)
-    with open(output_file, "w", newline="", encoding="utf-8") as f:
+    with atomic_csv_output(output_file) as f:
         writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
         writer.writeheader()
         for otp in results:
@@ -920,7 +943,7 @@ def export_bitwarden_csv(accounts, output_file, folder=None, quiet=False):
     Issuer, algorithm, digits, period, and counter are always written as columns.
     """
     validate_account_secrets(accounts, quiet=quiet)
-    with open(output_file, "w", newline="", encoding="utf-8") as f:
+    with atomic_csv_output(output_file) as f:
         writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
         writer.writeheader()
 
@@ -967,7 +990,7 @@ def export_bitwarden_csv(accounts, output_file, folder=None, quiet=False):
 def write_bitwarden_csv(results, output_file, folder=None, quiet=False):
     """Write OTP params to a Bitwarden-compatible CSV with full otpauth URIs."""
     validate_account_secrets(results, quiet=quiet)
-    with open(output_file, "w", newline="", encoding="utf-8") as f:
+    with atomic_csv_output(output_file) as f:
         writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
         writer.writeheader()
         for otp in results:
@@ -1200,9 +1223,9 @@ def load_accounts_from_file(path, fmt="auto", quiet=False):
 def load_accounts_from_image(path, quiet=False):
     img = cv2.imread(path)
     if img is None:
-        label = "image" if quiet else path
-        print(f"  [Error] Could not read image: {label}", file=sys.stderr)
-        return []
+        raise UnreadableQRError(
+            "Could not read image (unreadable or unsupported format)"
+        )
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     kernel = np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]])
@@ -1423,6 +1446,14 @@ def main(argv=None):
             )
             return 1
 
+        if file_errors:
+            print(
+                f"\nImport failed: {len(file_errors)} file(s) had errors: {failed_str}; "
+                "no CSV was written.",
+                file=sys.stderr,
+            )
+            return 1
+
         if results:
             out = args.output or "bitwarden_import.csv"
             try:
@@ -1432,22 +1463,6 @@ def main(argv=None):
             except Exception as e:  # noqa: BLE001 - CSV serialization may raise multiple errors
                 print(f"Error writing CSV file: {e}", file=sys.stderr)
                 return 1
-
-        if file_errors:
-            if not results:
-                print(
-                    f"\nImport failed: {len(file_errors)} file(s) had errors: {failed_str}; "
-                    "no CSV was written.",
-                    file=sys.stderr,
-                )
-            else:
-                out = args.output or "bitwarden_import.csv"
-                print(f"\n{out} is PARTIAL: excludes {failed_str}", file=sys.stderr)
-                print(
-                    f"Import finished with errors: {len(file_errors)} file(s) had errors: {failed_str}.",
-                    file=sys.stderr,
-                )
-            return 1
 
         if not results:
             print("\nNo accounts extracted.", file=sys.stderr)

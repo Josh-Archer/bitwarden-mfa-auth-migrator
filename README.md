@@ -107,7 +107,7 @@ python ga_to_bitwarden.py --live [-o out.csv] [--bw-folder NAME] [-q]
 
 | Option | Description |
 |--------|-------------|
-| `input` | Image, plain `otpauth://` URI list, unencrypted Aegis JSON, decrypted Authy JSON, or a directory of supported files (in directory mode, valid files are exported even if one file reports errors, with a non-zero exit; if any `.json` is truncated or corrupt, no CSV is written and `-o` is left untouched) |
+| `input` | Image, plain `otpauth://` URI list, unencrypted Aegis JSON, decrypted Authy JSON, or a directory of supported files (if any supported file reports an error, no CSV is written and an existing `-o` is left untouched) |
 | `--format`, `-f` | Force format (`auto` sniffs extension + content) |
 | `--live` | Webcam QR scanning (GA migration + otpauth QRs) |
 | `--output`, `-o` | Output CSV path (default: `bitwarden_import.csv`) |
@@ -133,7 +133,7 @@ When no accounts are exported, or when invalid/empty secrets or corrupted files 
 | Invalid or empty secret in import | `ValueError` | 1 |
 | File read/parse failure in import | `ValueError` / `OSError` | 1 |
 
-Invalid or empty secrets report the affected account name (or generic `entry` under `--quiet`) and fail the import before any CSV is written. Hex-looking secrets made only of `A–F` and `2–7` decode as base32 with a warning asking to verify the account format; legacy hex strings failing base32 decode as hexadecimal with an explicit warning naming the account. In directory mode, errors from a bad file are reported without aborting the export of other valid files (with partial export overwriting an existing `-o` file), while still returning a non-zero exit code. However, if any `.json` inside the directory is truncated or corrupt, the run exits non-zero and does not write or overwrite the `-o` output. All error lines, warnings, and summary error messages are emitted to stderr.
+Invalid or empty secrets report the affected account name (or generic `entry` under `--quiet`) and fail the import before any CSV is written. Hex-looking secrets made only of `A–F` and `2–7` decode as base32 with a warning asking to verify the account format; legacy hex strings failing base32 decode as hexadecimal with an explicit warning naming the account. In directory mode, files with errors are reported while the other valid files are still processed, but no CSV is written and an existing `-o` file is left untouched. CSV files are written to a temporary file and replace the destination only after the complete export succeeds. All error lines, warnings, and summary error messages are emitted to stderr.
 
 The tool also refuses to write an empty CSV.
 
