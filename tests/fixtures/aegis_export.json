@@ -34,6 +34,20 @@
           "digits": 8,
           "period": 60
         }
+      },
+      {
+        "type": "hotp",
+        "uuid": "00000000-0000-4000-8000-000000000003",
+        "name": "counter-user",
+        "issuer": "Example HOTP",
+        "note": "fixture HOTP entry",
+        "icon": null,
+        "info": {
+          "secret": "EXAMPLENOTREALCC",
+          "algo": "SHA512",
+          "digits": 8,
+          "counter": 5
+        }
       }
     ]
   }

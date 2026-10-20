@@ -16,6 +16,17 @@
       "digits": 8,
       "algorithm": "SHA256",
       "unique_id": "1002"
+    },
+    {
+      "account_type": "Example HOTP",
+      "name": "counter-user",
+      "issuer": "Example HOTP",
+      "decrypted_seed": "EXAMPLENOTREALCC",
+      "digits": 8,
+      "algorithm": "SHA512",
+      "type": "hotp",
+      "counter": 5,
+      "unique_id": "1003"
     }
   ]
 }

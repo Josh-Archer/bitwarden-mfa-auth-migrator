@@ -20,16 +20,16 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from ga_to_bitwarden import (  # noqa: E402
-    ProtobufParseError,
+from ga_to_bitwarden import (
     EmptyPayloadError,
+    ProtobufParseError,
     decode_migration_url,
     parse_migration_payload,
     parse_otp_parameters,
     read_varint,
     skip_field,
 )
-from tests.proto_helpers import (  # noqa: E402
+from tests.proto_helpers import (
     encode_fixed32_field,
     encode_fixed64_field,
     encode_key,

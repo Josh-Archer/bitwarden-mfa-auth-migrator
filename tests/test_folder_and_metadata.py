@@ -15,8 +15,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import ga_to_bitwarden as m  # noqa: E402
-from tests.protobuf_fixtures import sample_accounts_payload  # noqa: E402
+import ga_to_bitwarden as m
+from tests.protobuf_fixtures import sample_accounts_payload
 
 FIXTURES = Path(__file__).parent / "fixtures"
 DEMO_SECRET_B32 = "EXAMPLENOTREALAA"
@@ -243,7 +243,7 @@ class TestCliFolderFlag(unittest.TestCase):
             self.assertEqual(rc, 0)
             with open(out, newline="", encoding="utf-8") as f:
                 rows = list(csv.DictReader(f))
-        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(rows), 3)
         for row in rows:
             self.assertEqual(row["folder"], "")
             for column in METADATA_COLUMNS:

@@ -8,7 +8,7 @@ A Python tool to migrate TOTP/HOTP secrets from common authenticator apps into a
 - **Webcam Support**: Live scanning of QR codes directly from your phone screen.
 - **Robust Parsing**: Uses `pyzbar` and advanced image enhancement to read dense/blurry QR codes.
 - **Secure**: Runs locally. Can suppress PII output with `--quiet`.
-- **Full TOTP params**: Exports `otpauth://` URIs preserving algorithm (SHA1/SHA256/SHA512), digits (6/8), type (TOTP/HOTP), and HOTP counter—not secret-only defaults.
+- **Full TOTP params**: Preserves non-default algorithm, digits, period, and HOTP settings in `otpauth://` URIs. Standard TOTP entries use a bare base32 secret.
 
 ## Prerequisites
 
@@ -49,36 +49,6 @@ Many apps (FreeOTP, andOTP export-as-URI, Authy after conversion, password manag
 
 ```
 otpauth://totp/Example:user@example.com?secret=EXAMPLENOTREALAA&issuer=Example
-```
-
-**Secure session handling**
-
-| Approach | Recommendation |
-|---|---|
-| `BW_SESSION` environment variable | **Preferred.** Not passed on argv; clear when done. |
-| `--bw-session <key>` | Supported but **discouraged** (visible in process list / shell history). |
-
-The tool never writes `BW_SESSION` or TOTP secrets to log files. Account labels are only printed if you omit `--quiet`.
-
-**Failure handling**
-
-- If the vault is locked, `bw` is missing, or `bw sync` fails **before** creates, the tool aborts with a non-zero exit and **creates no items**.
-- If some item creates fail mid-run, the summary reports exact success/failure counts and lists failed accounts (unless `--quiet`). Exit code is non-zero (`2` for partial, `1` for total failure). Already-created items remain in the vault — there is **no silent partial success**.
-
-Optional flags for direct import:
-
-- `--bw-folder "My Folder"` — destination folder column on each CSV row (default: `Google Authenticator Migration` for Google Authenticator exports). Aegis, Authy, and otpauth imports use a source-specific folder unless this flag is set. Use `--bw-folder ""` for a blank folder.
-- `-o path.csv` — also write a CSV **only if you explicitly request it** (not recommended; delete immediately).
-
-### 4. Options
-
-- `--output`, `-o`: Specify output CSV filename. Default without `--import-bw`: `bitwarden_import.csv`. With `--import-bw`, omitted unless you set `-o`.
-- `--quiet`, `-q`: Suppress printing account names to the console (useful for privacy).
-- `--require-zbar`: Fail immediately if pyzbar is not installed (recommended for dense export QRs).
-
-```bash
-python ga_to_bitwarden.py my_uris.txt
-python ga_to_bitwarden.py my_uris.txt --format otpauth
 ```
 
 QR images that encode a single `otpauth://…` payload are also accepted (same image pipeline as GA).
@@ -126,6 +96,8 @@ Tokens that only contain `encrypted_seed` (no plaintext secret) are skipped; if 
 
 > Prefer converting Authy output to `otpauth://` lines if your export tool supports that—the otpauth path is the most portable.
 
+The tool writes a Bitwarden-compatible CSV locally; it does not connect to a vault. By default the file is `bitwarden_import.csv`. `--output` and `--bw-folder` let you choose the CSV path and destination folder. Account labels are only printed if you omit `--quiet`; under `--quiet`, errors and warnings refer to a generic `entry` label instead, and file names are masked (e.g. `file #1`).
+
 ## Usage (CLI)
 
 ```bash
@@ -135,12 +107,13 @@ python ga_to_bitwarden.py --live [-o out.csv] [--bw-folder NAME] [-q]
 
 | Option | Description |
 |--------|-------------|
-| `input` | Image, `.txt` URI list, `.json` export, or a directory of such files |
+| `input` | Image, plain `otpauth://` URI list, unencrypted Aegis JSON, decrypted Authy JSON, or a directory of supported files (if any supported file reports an error, no CSV is written and an existing `-o` is left untouched) |
 | `--format`, `-f` | Force format (`auto` sniffs extension + content) |
 | `--live` | Webcam QR scanning (GA migration + otpauth QRs) |
 | `--output`, `-o` | Output CSV path (default: `bitwarden_import.csv`) |
-| `--bw-folder` | Folder column for every row. Default for Google Authenticator exports: `Google Authenticator Migration`. Pass `""` for a blank folder. |
-| `--quiet`, `-q` | Do not print account names to the console |
+| `--bw-folder` | Folder column for every row. Defaults to a source-specific folder. Pass `""` for a blank folder. |
+| `--quiet`, `-q` | Do not print account names or file names to the console (suppresses account names in errors/warnings and masks file names) |
+| `--require-zbar` | Fail unless `pyzbar` is installed; useful when dense QR exports need ZBar |
 
 Example:
 
@@ -150,23 +123,21 @@ python ga_to_bitwarden.py C:\exports\ --output my_codes.csv --quiet
 
 ### Exit codes / errors
 
-When no accounts are exported, the tool reports a **distinct** error instead of a silent empty file:
+When no accounts are exported, or when invalid/empty secrets or corrupted files are encountered, the tool reports a **distinct** error instead of a silent empty file:
 
 | Situation | Error type | Typical exit code |
 |-----------|------------|-------------------|
 | pyzbar missing and no QR decoded | `MissingDependencyError` | 2 |
 | Images/QR unreadable | `UnreadableQRError` | 1 |
 | QR found but payload empty/invalid | `EmptyPayloadError` | 3 |
+| Invalid or empty secret in import | `ValueError` | 1 |
+| File read/parse failure in import | `ValueError` / `OSError` | 1 |
+
+Invalid or empty secrets report the affected account name (or generic `entry` under `--quiet`) and fail the import before any CSV is written. Hex-looking secrets made only of `A–F` and `2–7` decode as base32 with a warning asking to verify the account format; legacy hex strings failing base32 decode as hexadecimal with an explicit warning naming the account. In directory mode, files with errors are reported while the other valid files are still processed, but no CSV is written and an existing `-o` file is left untouched. CSV files are written to a temporary file and replace the destination only after the complete export succeeds. All error lines, warnings, and summary error messages are emitted to stderr.
 
 The tool also refuses to write an empty CSV.
 
 ## Importing to Bitwarden / Vaultwarden
-
-### Preferred: direct CLI (no residual secret file)
-
-See [Direct Bitwarden CLI import](#3-direct-bitwarden-cli-import-no-csv-on-disk) above. Secrets stay in memory and the vault; nothing is left on disk for you to remember to delete.
-
-### Alternative: CSV import
 
 1. Log in to your Web Vault.
 2. Go to **Tools → Import Data**.
@@ -176,7 +147,7 @@ See [Direct Bitwarden CLI import](#3-direct-bitwarden-cli-import-no-csv-on-disk)
 
 ## Tests
 
-Fixture data under `tests/fixtures/` uses only public demo secrets (not real credentials):
+Fixture data under `tests/fixtures/` uses fake placeholder secrets only (not real credentials):
 
 ```bash
 python -m unittest discover -s tests -v
@@ -188,7 +159,9 @@ Bitwarden’s CSV importer accepts either a bare base32 secret or a full
 [`otpauth://`](https://github.com/google/google-authenticator/wiki/Key-Uri-Format) URI
 in the `login_totp` column.
 
-This tool **always writes a full `otpauth://` URI**, including:
+The `login_totp` field contains a full `otpauth://` URI when non-default settings
+need to be preserved (including every HOTP entry). TOTP entries with standard
+defaults use the bare base32 secret. URI parameters include:
 
 | Parameter   | Source / default |
 |-------------|------------------|
@@ -196,18 +169,19 @@ This tool **always writes a full `otpauth://` URI**, including:
 | `issuer`    | Account issuer when present |
 | `algorithm` | SHA1 / SHA256 / SHA512 / MD5 (from export) |
 | `digits`    | 6 or 8 (from export) |
-| `period`    | `30` (Google Authenticator standard; not in export payload) |
+| `period`    | TOTP period, default `30` (not applicable to HOTP) |
 | `counter`   | HOTP only (from export when present) |
 
-Writing the full URI ensures non-default algorithms and digit counts survive
-import. A bare secret alone would force Bitwarden’s defaults (SHA1, 6 digits)
-and break those accounts.
+The full URI is written when non-default settings need to be preserved,
+including every HOTP entry. Standard TOTP entries use a bare base32 secret.
+A bare secret uses Bitwarden’s defaults (SHA1, 6 digits, 30-second period).
 
 The same values are also kept as their own CSV columns — `issuer`, `algorithm`,
 `digits`, `period`, and `counter` — so they are not dropped when a row is
 written. Bitwarden’s importer reads TOTP settings from `login_totp` and ignores
-the extra columns. The `folder` column is `Google Authenticator Migration`
-unless you pass `--bw-folder`.
+the extra columns. By default, entries go into a source-specific folder:
+`Google Authenticator Migration`, `Aegis Migration`, `Authy Migration`, or
+`otpauth URI Import`. Pass `--bw-folder` to choose one folder for every row.
 
 ## ⚠️ Security Warning
 

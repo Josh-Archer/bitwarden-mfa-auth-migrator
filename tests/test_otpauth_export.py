@@ -1,5 +1,4 @@
 """Tests for preserving algorithm, digits, and type in Bitwarden export (#3)."""
-import base64
 import csv
 import os
 import sys
@@ -14,8 +13,8 @@ from ga_to_bitwarden import (
     ALGORITHM_MAP,
     DIGITS_MAP,
     build_otpauth_uri,
-    parse_otp_parameters,
     parse_migration_payload,
+    parse_otp_parameters,
     secret_to_base32,
     write_bitwarden_csv,
 )
