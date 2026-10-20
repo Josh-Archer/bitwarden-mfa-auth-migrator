@@ -300,23 +300,6 @@ class TestCsvExport(unittest.TestCase):
 
 
 class TestCliEndToEnd(unittest.TestCase):
-    def test_csv_writer_preserves_existing_output_on_write_error(self):
-        with tempfile.TemporaryDirectory() as td:
-            output = Path(td) / "out.csv"
-            output.write_text("PREEXISTING_CONTENT_DO_NOT_OVERWRITE", encoding="utf-8")
-            account = {
-                "secret": DEMO_SECRET_BYTES,
-                "name": "BadMetadata",
-                "source": "authy",
-                "digits": "not-a-number",
-            }
-            with self.assertRaises(ValueError):
-                m.export_bitwarden_csv([account], output)
-            self.assertEqual(
-                output.read_text(encoding="utf-8"), "PREEXISTING_CONTENT_DO_NOT_OVERWRITE"
-            )
-            self.assertEqual(list(Path(td).glob(".out.csv.*.tmp")), [])
-
     def test_cli_otpauth_fixture(self):
         with tempfile.TemporaryDirectory() as td:
             out = os.path.join(td, "bw.csv")

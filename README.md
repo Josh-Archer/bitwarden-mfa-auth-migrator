@@ -1,6 +1,6 @@
 # Bitwarden MFA Auth Migrator
 
-A Python tool to migrate TOTP/HOTP secrets from common authenticator apps into a Bitwarden/Vaultwarden-compatible CSV.
+A Python tool to migrate TOTP/HOTP secrets from common authenticator apps into Bitwarden/Vaultwarden, either directly or through a compatible CSV.
 
 ## Features
 
@@ -96,22 +96,34 @@ Tokens that only contain `encrypted_seed` (no plaintext secret) are skipped; if 
 
 > Prefer converting Authy output to `otpauth://` lines if your export tool supports that—the otpauth path is the most portable.
 
-The tool writes a Bitwarden-compatible CSV locally; it does not connect to a vault. By default the file is `bitwarden_import.csv`. `--output` and `--bw-folder` let you choose the CSV path and destination folder. Account labels are only printed if you omit `--quiet`; under `--quiet`, errors and warnings refer to a generic `entry` label instead, and file names are masked (e.g. `file #1`).
+By default the tool writes a Bitwarden-compatible CSV locally (`bitwarden_import.csv`). Use `--import-bw` to create login items directly through the Bitwarden CLI. The direct path reads the session from `BW_SESSION`; it never accepts the session key as a command-line argument. `--output` and `--bw-folder` choose the CSV path and destination folder. Account labels are only printed if you omit `--quiet`; under `--quiet`, errors and warnings refer to a generic `entry` label instead, and file names are masked (e.g. `file #1`).
+
+Install and unlock the [Bitwarden CLI](https://bitwarden.com/help/cli/) first, then run:
+
+```bash
+export BW_SESSION="$(bw unlock --raw)"
+python ga_to_bitwarden.py aegis-export.json --import-bw --quiet
+unset BW_SESSION
+```
+
+The CLI must be on `PATH`, and its vault must be unlocked. `--bw-folder` chooses the destination folder; when omitted, the same source-specific folder used by CSV export is used. A folder is created if it does not already exist. Add `--dry-run` to parse the input and report the number of accounts without invoking `bw` or changing the vault. Add `--output path.csv` with `--import-bw` only if you also want a CSV copy written locally.
 
 ## Usage (CLI)
 
 ```bash
-python ga_to_bitwarden.py <input> [--format auto|qr|ga|otpauth|aegis|authy] [-o out.csv] [--bw-folder NAME] [-q]
-python ga_to_bitwarden.py --live [-o out.csv] [--bw-folder NAME] [-q]
+python ga_to_bitwarden.py <input> [--format auto|qr|ga|otpauth|aegis|authy] [--import-bw [--dry-run]] [-o out.csv] [--bw-folder NAME] [-q]
+python ga_to_bitwarden.py --live [--import-bw [--dry-run]] [-o out.csv] [--bw-folder NAME] [-q]
 ```
 
 | Option | Description |
 |--------|-------------|
-| `input` | Image, plain `otpauth://` URI list, unencrypted Aegis JSON, decrypted Authy JSON, or a directory of supported files (if any supported file reports an error, no CSV is written and an existing `-o` is left untouched) |
+| `input` | Image, plain `otpauth://` URI list, unencrypted Aegis JSON, decrypted Authy JSON, or a directory of supported files (if any supported file reports an error, no CSV is written, no direct import is attempted, and an existing `-o` is left untouched) |
 | `--format`, `-f` | Force format (`auto` sniffs extension + content) |
 | `--live` | Webcam QR scanning (GA migration + otpauth QRs) |
-| `--output`, `-o` | Output CSV path (default: `bitwarden_import.csv`) |
+| `--output`, `-o` | CSV output path (default: `bitwarden_import.csv`; omitted by default with `--import-bw`) |
 | `--bw-folder` | Folder column for every row. Defaults to a source-specific folder. Pass `""` for a blank folder. |
+| `--import-bw` | Create items directly through `bw`; requires an unlocked CLI session in `BW_SESSION`. |
+| `--dry-run` | With `--import-bw`, report the number of parsed accounts without invoking `bw`. |
 | `--quiet`, `-q` | Do not print account names or file names to the console (suppresses account names in errors/warnings and masks file names) |
 | `--require-zbar` | Fail unless `pyzbar` is installed; useful when dense QR exports need ZBar |
 
@@ -133,17 +145,25 @@ When no accounts are exported, or when invalid/empty secrets or corrupted files 
 | Invalid or empty secret in import | `ValueError` | 1 |
 | File read/parse failure in import | `ValueError` / `OSError` | 1 |
 
-Invalid or empty secrets report the affected account name (or generic `entry` under `--quiet`) and fail the import before any CSV is written. Hex-looking secrets made only of `A–F` and `2–7` decode as base32 with a warning asking to verify the account format; legacy hex strings failing base32 decode as hexadecimal with an explicit warning naming the account. In directory mode, files with errors are reported while the other valid files are still processed, but no CSV is written and an existing `-o` file is left untouched. CSV files are written to a temporary file and replace the destination only after the complete export succeeds. All error lines, warnings, and summary error messages are emitted to stderr.
+Invalid or empty secrets report the affected account name (or generic `entry` under `--quiet`) and fail the import before any CSV is written or any Bitwarden CLI call is made. Hex-looking secrets made only of `A–F` and `2–7` decode as base32 with a warning asking to verify the account format; legacy hex strings failing base32 decode as hexadecimal with an explicit warning naming the account. In directory mode, files with errors are reported while valid files are still parsed, but no CSV is written and no direct import is attempted; an existing `-o` file is left untouched. CSV files are written to a temporary file and replace the destination only after the complete export succeeds. All error lines, warnings, and summary error messages are emitted to stderr.
 
 The tool also refuses to write an empty CSV.
 
 ## Importing to Bitwarden / Vaultwarden
 
+### Direct CLI import
+
+Use `--import-bw` with an unlocked Bitwarden CLI session as shown above. Items are created as login entries with the OTP URI, username, notes, and folder. The tool reports success and failure counts; a partial failure returns exit code `2`. Failed account labels are omitted with `--quiet`. CLI output is not printed because it can contain vault data.
+
+Re-running an import creates duplicate items; review the destination folder before retrying a completed import.
+
+### CSV import
+
 1. Log in to your Web Vault.
 2. Go to **Tools → Import Data**.
 3. Select **Bitwarden (csv)** as the file format.
 4. Upload the generated CSV file.
-5. **Delete the CSV** after verifying codes work.
+5. **Delete the CSV** after verifying codes work. The CSV contains TOTP secrets in plaintext.
 
 ## Tests
 

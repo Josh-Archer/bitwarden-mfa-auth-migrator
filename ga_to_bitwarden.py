@@ -4,10 +4,13 @@
 
 import argparse
 import base64
+import copy
 import csv
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import urllib.parse
@@ -41,9 +44,13 @@ class EmptyPayloadError(MigrationError):
     """QR/URL decoded but migration payload was missing, invalid, or empty."""
 
 
+class BitwardenCliError(MigrationError):
+    """A safe, non-sensitive error returned by the Bitwarden CLI workflow."""
+
+
 @contextmanager
 def atomic_csv_output(output_file):
-    """Write a CSV beside its destination and replace it only when complete."""
+    """Replace the destination only after a complete CSV has been written."""
     output_path = os.fspath(output_file)
     output_dir = os.path.dirname(os.path.abspath(output_path))
     prefix = f".{os.path.basename(output_path)}."
@@ -919,14 +926,19 @@ def build_totp_uri(account):
     params = {"secret": secret_b32}
     if issuer:
         params["issuer"] = issuer
-    algo = (account.get("algorithm") or "SHA1").upper()
+    metadata = normalized_otp_metadata(account)
+    algo = metadata["algorithm"]
     if algo and algo != "SHA1":
         params["algorithm"] = algo
-    digits = account.get("digits") or 6
-    if digits and int(digits) != 6:
+    digits = int(metadata["digits"])
+    if digits != 6:
         params["digits"] = str(digits)
-    period = account.get("period") or 30
+    period = int(metadata["period"])
     otp_type = account.get("type") or "totp"
+    if isinstance(otp_type, int):
+        otp_type = otp_type_name(otp_type)
+    else:
+        otp_type = str(otp_type).lower()
     if otp_type == "hotp":
         params["counter"] = str(account.get("counter") or 0)
     elif period and int(period) != 30:
@@ -954,15 +966,20 @@ def export_bitwarden_csv(accounts, output_file, folder=None, quiet=False):
             display_name = f"{issuer}: {name}" if issuer else name
             source = otp.get("source") or ""
             if folder is None:
-                row_folder = _SOURCE_FOLDER_NAMES.get(source, "Authenticator Migration")
+                row_folder = _SOURCE_FOLDER_NAMES.get(source, DEFAULT_BW_FOLDER)
             else:
                 row_folder = folder
 
             # Use full otpauth URI when non-default params so Bitwarden preserves them
-            algo = (otp.get("algorithm") or "SHA1").upper()
-            digits = int(otp.get("digits") or 6)
-            period = int(otp.get("period") or 30)
+            metadata = normalized_otp_metadata(otp)
+            algo = metadata["algorithm"]
+            digits = int(metadata["digits"])
+            period = int(metadata["period"])
             otp_type = otp.get("type") or "totp"
+            if isinstance(otp_type, int):
+                otp_type = otp_type_name(otp_type)
+            else:
+                otp_type = str(otp_type).lower()
             non_default = (
                 otp_type != "totp"
                 or algo != "SHA1"
@@ -995,6 +1012,208 @@ def write_bitwarden_csv(results, output_file, folder=None, quiet=False):
         writer.writeheader()
         for otp in results:
             writer.writerow(otp_to_csv_row(otp, folder=folder))
+
+
+def _bw_cli_run(command, *, input_text=None, bw_path="bw"):
+    """Run bw without putting session keys or item JSON in the process list.
+
+    The CLI reads its session from BW_SESSION in the inherited environment.
+    JSON for encode/create is passed through stdin. CLI output is captured and
+    never included in errors because it may contain vault data.
+    """
+    try:
+        result = subprocess.run(
+            [bw_path, *command],
+            input=input_text,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise BitwardenCliError("Could not start the Bitwarden CLI.") from exc
+    if result.returncode != 0:
+        raise BitwardenCliError(f"Bitwarden CLI command '{command[0]}' failed.")
+    return result.stdout
+
+
+def _bw_encode_json(value, *, bw_path):
+    return _bw_cli_run(["encode"], input_text=json.dumps(value), bw_path=bw_path).strip()
+
+
+def _bw_create_object(kind, value, *, bw_path):
+    encoded = _bw_encode_json(value, bw_path=bw_path)
+    return _bw_cli_run(["create", kind], input_text=encoded, bw_path=bw_path)
+
+
+def _bw_folder_id(folder_name, folders, *, bw_path):
+    if not folder_name:
+        return None
+    match = next((f for f in folders if f.get("name") == folder_name), None)
+    if match:
+        return match.get("id")
+    template = json.loads(_bw_cli_run(["get", "template", "folder"], bw_path=bw_path))
+    if not isinstance(template, dict):
+        raise BitwardenCliError("Bitwarden returned an invalid folder template.")
+    template["name"] = folder_name
+    created = json.loads(_bw_create_object("folder", template, bw_path=bw_path))
+    if not isinstance(created, dict):
+        raise BitwardenCliError("Bitwarden returned an invalid created folder.")
+    return created.get("id")
+
+
+def _bw_item_from_account(account, folder_id, *, folder=None):
+    """Build a Bitwarden login item while reusing the CSV mapping and metadata."""
+    row = otp_to_csv_row(account, folder=folder)
+    notes = account.get("notes") or f"Migrated from {account.get('source') or 'authenticator'}"
+    item = {
+        "type": 1,
+        "name": row["name"],
+        "notes": notes,
+        "favorite": False,
+        "folderId": folder_id,
+        "login": {
+            "username": row["login_username"],
+            "password": None,
+            "totp": row["login_totp"],
+            "uris": [],
+        },
+        "fields": [],
+    }
+    return item
+
+
+def import_accounts_to_bitwarden(accounts, *, folder=None, quiet=False, dry_run=False):
+    """Create login items with the Bitwarden CLI using BW_SESSION.
+
+    A dry run validates the requested operation without invoking ``bw``.
+    Returns (created_count, failed_labels); secrets and CLI output are never
+    printed or included in raised errors.
+    """
+    # Validate the complete batch before touching the Bitwarden CLI. In
+    # particular, an empty secret must never become an empty login TOTP.
+    validate_account_secrets(accounts, quiet=quiet)
+    if dry_run:
+        return 0, []
+
+    bw_path = shutil.which("bw")
+    if not bw_path:
+        raise BitwardenCliError("Bitwarden CLI ('bw') was not found on PATH.")
+    if not os.environ.get("BW_SESSION"):
+        raise BitwardenCliError("BW_SESSION is not set. Unlock the vault with 'bw unlock'.")
+
+    try:
+        status = json.loads(_bw_cli_run(["status"], bw_path=bw_path))
+    except (json.JSONDecodeError, BitwardenCliError):
+        raise BitwardenCliError("Could not verify Bitwarden CLI session status.") from None
+    if not isinstance(status, dict) or status.get("status") != "unlocked":
+        raise BitwardenCliError("Bitwarden vault is not unlocked. Run 'bw unlock' first.")
+    _bw_cli_run(["sync"], bw_path=bw_path)
+    try:
+        folders = json.loads(_bw_cli_run(["list", "folders"], bw_path=bw_path))
+    except (json.JSONDecodeError, BitwardenCliError):
+        raise BitwardenCliError("Could not read Bitwarden folders.") from None
+    if not isinstance(folders, list) or any(not isinstance(folder_info, dict) for folder_info in folders):
+        raise BitwardenCliError("Bitwarden returned an invalid folder list.")
+
+    # Ensure the chosen folder exists before creating any login items.
+    effective_folder = folder
+    if effective_folder is None:
+        sources = {account.get("source") for account in accounts}
+        if len(sources) == 1:
+            source = next(iter(sources))
+            effective_folder = _SOURCE_FOLDER_NAMES.get(source, DEFAULT_BW_FOLDER)
+        else:
+            effective_folder = DEFAULT_BW_FOLDER
+    folder_id = _bw_folder_id(effective_folder, folders, bw_path=bw_path)
+
+    created = 0
+    failed = []
+    item_template = None
+    for account in accounts:
+        label = account.get("name") or "Unknown"
+        issuer = account.get("issuer") or ""
+        if issuer:
+            label = f"{issuer}: {label}"
+        try:
+            item = _bw_item_from_account(account, folder_id, folder=effective_folder)
+            if item_template is None:
+                item_template = json.loads(
+                    _bw_cli_run(["get", "template", "item"], bw_path=bw_path)
+                )
+                if not isinstance(item_template, dict):
+                    raise BitwardenCliError("Bitwarden returned an invalid login item template.")
+                if not isinstance(item_template.get("login"), dict):
+                    raise BitwardenCliError("Bitwarden returned an invalid login item template.")
+            template = copy.deepcopy(item_template)
+            login = template.get("login")
+            login.update(item["login"])
+            item["login"] = login
+            template.update(item)
+            _bw_create_object("item", template, bw_path=bw_path)
+            created += 1
+        except (BitwardenCliError, json.JSONDecodeError):
+            failed.append(label)
+    return created, failed
+
+
+def deliver_accounts(args, accounts):
+    """Write a CSV, import directly, or report a dry run for parsed accounts."""
+    def write_optional_csv(path):
+        if any(account.get("source") for account in accounts):
+            export_bitwarden_csv(
+                accounts, path, folder=args.bw_folder, quiet=args.quiet
+            )
+        else:
+            export_accounts_to_csv(
+                accounts, path, folder=args.bw_folder, quiet=args.quiet
+            )
+
+    if args.import_bw:
+        if args.dry_run:
+            try:
+                validate_account_secrets(accounts, quiet=args.quiet)
+            except ValueError as exc:
+                print(f"Error importing to Bitwarden: {exc}", file=sys.stderr)
+                return 1
+            print(f"Dry run: would import {len(accounts)} account(s) to Bitwarden.")
+            return 0
+        try:
+            # CSV output is optional on the direct path and requested explicitly.
+            if args.output:
+                write_optional_csv(args.output)
+            created, failed = import_accounts_to_bitwarden(
+                accounts, folder=args.bw_folder, quiet=args.quiet
+            )
+        except (BitwardenCliError, OSError, EmptyPayloadError, ValueError, csv.Error) as exc:
+            print(f"Error importing to Bitwarden: {exc}", file=sys.stderr)
+            return 1
+        print(f"Successfully imported {created} account(s) to Bitwarden.")
+        if failed:
+            print(f"Failed to import {len(failed)} account(s).", file=sys.stderr)
+            if not args.quiet:
+                for label in failed:
+                    print(f"  [Failed] {label}", file=sys.stderr)
+            return 2 if created else 1
+        if args.output:
+            print(f"Also wrote CSV to {args.output}")
+        return 0
+
+    output_file = args.output or "bitwarden_import.csv"
+    try:
+        write_optional_csv(output_file)
+        print(f"\nSuccessfully exported {len(accounts)} accounts to {output_file}")
+        print("Next steps:")
+        print("1. Open Vaultwarden Web Vault")
+        print("2. Go to Tools -> Import Data")
+        print(f"3. Select 'Bitwarden (csv)' and upload {output_file}")
+        print("4. IMPORTANT: Delete the CSV file after verification!")
+        return 0
+    except EmptyPayloadError as exc:
+        print(f"Error writing CSV file: {exc}", file=sys.stderr)
+        return 3
+    except (OSError, ValueError, csv.Error) as exc:
+        print(f"Error writing CSV file: {exc}", file=sys.stderr)
+        return 1
 
 
 # Test/compat aliases for renamed helpers
@@ -1330,7 +1549,9 @@ def live_scan(quiet=False):
     return all_results
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Convert Google Authenticator Export QR codes to Bitwarden CSV.")
+    parser = argparse.ArgumentParser(
+        description="Migrate authenticator exports to Bitwarden CSV or directly into a vault."
+    )
     parser.add_argument("input", nargs='?', help="Path to image file or directory containing QR screenshots")
     parser.add_argument("--live", action="store_true", help="Use webcam for live scanning")
     parser.add_argument(
@@ -1342,7 +1563,10 @@ def main(argv=None):
     parser.add_argument(
         "--output", "-o",
         default=None,
-        help="Output CSV file path (default: bitwarden_import.csv)",
+        help=(
+            "CSV output path (default: bitwarden_import.csv; omitted by default "
+            "with --import-bw)"
+        ),
     )
     parser.add_argument(
         "--bw-folder",
@@ -1354,6 +1578,16 @@ def main(argv=None):
             "Pass an empty string to leave the folder blank."
         ),
     )
+    parser.add_argument(
+        "--import-bw",
+        action="store_true",
+        help="Create login items directly in Bitwarden using the bw CLI and BW_SESSION",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="With --import-bw, show how many items would be created without invoking bw",
+    )
     parser.add_argument("--quiet", "-q", action="store_true", help="Do not print account names/PII to console")
     parser.add_argument(
         "--require-zbar",
@@ -1362,6 +1596,9 @@ def main(argv=None):
     )
     
     args = parser.parse_args(argv)
+
+    if args.dry_run and not args.import_bw:
+        parser.error("--dry-run requires --import-bw")
 
     try:
         check_qr_dependencies(require_zbar=args.require_zbar)
@@ -1398,7 +1635,6 @@ def main(argv=None):
             files = [path]
         results = []
         file_errors = []
-        has_corrupt_json = False
         print(f"Found {len(files)} file(s) to process.")
         for idx, file_path in enumerate(files, 1):
             file_label = f"file #{idx}" if args.quiet else os.path.basename(file_path)
@@ -1418,12 +1654,6 @@ def main(argv=None):
                 if args.quiet:
                     err_msg = err_msg.replace(file_path, file_label).replace(os.path.basename(file_path), file_label)
                 print(f"  [Error] {err_msg}", file=sys.stderr)
-                is_corrupt = (
-                    isinstance(e, (json.JSONDecodeError, UnicodeDecodeError))
-                    or detected == "json-corrupt"
-                )
-                if is_corrupt:
-                    has_corrupt_json = True
                 file_errors.append((file_path, idx, err_msg))
                 continue
             if not accts:
@@ -1431,38 +1661,22 @@ def main(argv=None):
             else:
                 print(f"  [Success] {len(accts)} account(s) from this file.")
                 results.extend(accts)
-
         failed_labels = [
             f"file #{idx}" if args.quiet else os.path.basename(fp)
             for fp, idx, _ in file_errors
         ]
         failed_str = ", ".join(failed_labels)
 
-        if has_corrupt_json:
-            print(
-                f"\nImport failed: {len(file_errors)} file(s) had errors: {failed_str}; "
-                "no CSV was written.",
-                file=sys.stderr,
-            )
-            return 1
-
         if file_errors:
+            detail = "nothing was imported" if args.import_bw else "no CSV was written"
             print(
                 f"\nImport failed: {len(file_errors)} file(s) had errors: {failed_str}; "
-                "no CSV was written.",
+                f"{detail}.",
                 file=sys.stderr,
             )
             return 1
-
         if results:
-            out = args.output or "bitwarden_import.csv"
-            try:
-                export_bitwarden_csv(results, out, folder=args.bw_folder, quiet=args.quiet)
-                if not file_errors:
-                    print(f"\nSuccessfully exported {len(results)} accounts to {out}")
-            except Exception as e:  # noqa: BLE001 - CSV serialization may raise multiple errors
-                print(f"Error writing CSV file: {e}", file=sys.stderr)
-                return 1
+            return deliver_accounts(args, results)
 
         if not results:
             print("\nNo accounts extracted.", file=sys.stderr)
@@ -1599,24 +1813,7 @@ def main(argv=None):
             return 1
         return 3
 
-    output_file = args.output or "bitwarden_import.csv"
-    
-    try:
-        count = export_accounts_to_csv(results, output_file, folder=args.bw_folder, quiet=args.quiet)
-        print(f"\nSuccessfully exported {count} accounts to {output_file}")
-        print("Next steps:")
-        print("1. Open Vaultwarden Web Vault")
-        print("2. Go to Tools -> Import Data")
-        print(f"3. Select 'Bitwarden (csv)' and upload {output_file}")
-        print("4. IMPORTANT: Delete the CSV file after verification!")
-        return 0
-        
-    except EmptyPayloadError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return 3
-    except Exception as e:  # noqa: BLE001 - surface CSV write failures to the CLI
-        print(f"Error writing CSV file: {e}", file=sys.stderr)
-        return 1
+    return deliver_accounts(args, results)
 
 
 if __name__ == "__main__":
