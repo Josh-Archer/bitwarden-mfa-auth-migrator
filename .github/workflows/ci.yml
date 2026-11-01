@@ -25,10 +25,10 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install system libraries for pyzbar
+      - name: Install system libraries for pyzbar and OpenCV (libGL)
         run: |
           sudo apt-get update
-          sudo apt-get install -y libzbar0
+          sudo apt-get install -y --no-install-recommends libzbar0 libgl1 libglib2.0-0t64
 
       - name: Install dependencies
         run: |
